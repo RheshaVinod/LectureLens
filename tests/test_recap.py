@@ -1,10 +1,13 @@
+import io
 import json
 import time
 import unittest
 import uuid
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import app as lecture_app
 
@@ -70,7 +73,8 @@ class RecapApiTest(unittest.TestCase):
     def setUp(self):
         self.session_id = f"sess_test_{uuid.uuid4().hex}"
         with lecture_app.conn() as db:
-            db.execute("INSERT INTO sessions VALUES (?,?)", (self.session_id, int(time.time() * 1000)))
+            db.execute("INSERT INTO sessions (id, started_epoch_ms) VALUES (?,?)",
+                       (self.session_id, int(time.time() * 1000)))
             db.execute("""INSERT INTO segments
                        (id, session_id, start_ms, end_ms, speaker, language, text,
                         translated_text, translated_language)
@@ -81,10 +85,41 @@ class RecapApiTest(unittest.TestCase):
 
     def tearDown(self):
         with lecture_app.conn() as db:
+            snapshot_paths = [row["path"] for row in db.execute(
+                "SELECT path FROM snapshots WHERE session_id=?", (self.session_id,)).fetchall()]
             db.execute("DELETE FROM recaps WHERE session_id=?", (self.session_id,))
             db.execute("DELETE FROM messages WHERE session_id=?", (self.session_id,))
             db.execute("DELETE FROM segments WHERE session_id=?", (self.session_id,))
+            db.execute("DELETE FROM snapshots WHERE session_id=?", (self.session_id,))
             db.execute("DELETE FROM sessions WHERE id=?", (self.session_id,))
+        for path in snapshot_paths:
+            lecture_app.Path(path).unlink(missing_ok=True)
+
+    def test_phone_join_qr_and_tokenized_snapshot_upload(self):
+        join = self.client.get(f"/api/sessions/{self.session_id}/phone-join")
+        self.assertEqual(join.status_code, 200, join.text)
+        join_data = join.json()
+        token = parse_qs(urlparse(join_data["capture_url"]).query)["token"][0]
+
+        qr = self.client.get(join_data["qr_url"])
+        self.assertEqual(qr.status_code, 200)
+        self.assertEqual(qr.headers["content-type"], "image/png")
+
+        image = io.BytesIO()
+        Image.new("RGB", (320, 180), "white").save(image, "JPEG")
+        upload = self.client.post(f"/api/sessions/{self.session_id}/snapshots",
+                                  files={"image": ("board.jpg", image.getvalue(), "image/jpeg")},
+                                  data={"source": "phone", "capture_reason": "phone",
+                                        "join_token": token})
+        self.assertEqual(upload.status_code, 200, upload.text)
+        self.assertEqual(upload.json()["source"], "phone")
+        self.assertEqual(upload.json()["capture_reason"], "phone")
+
+        rejected = self.client.post(f"/api/sessions/{self.session_id}/snapshots",
+                                    files={"image": ("board.jpg", image.getvalue(), "image/jpeg")},
+                                    data={"source": "phone", "capture_reason": "phone",
+                                          "join_token": "wrong"})
+        self.assertEqual(rejected.status_code, 403)
 
     @patch.object(lecture_app.httpx, "AsyncClient", FakeAskAsyncClient)
     def test_answer_from_audio_transcript_without_snapshot(self):

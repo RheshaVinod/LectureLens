@@ -65,6 +65,10 @@ async function uploadSlides(files){if(!files.length)return;const form=new FormDa
   try{const data=await api(`/api/sessions/${state.sessionId}/slides`,{method:'POST',body:form});state.snapshots=[...data.slides,...state.snapshots];if(data.slides.length)selectSnapshot(data.slides[0],true);renderMoments();status(`${data.slides.length} slide${data.slides.length===1?'':'s'} added to lecture context`)}
   catch(e){status(e.message,true)}finally{$('uploadSlides').disabled=false;$('slideFiles').value=''}
 }
+async function openPhoneJoin(){const dialog=$('phoneDialog');$('connectPhone').disabled=true;
+  try{const join=await api(`/api/sessions/${state.sessionId}/phone-join`);$('phoneQr').src=`${join.qr_url}?v=${Date.now()}`;$('phoneLink').href=join.capture_url;$('phoneLink').textContent=join.capture_url;$('phoneWarning').hidden=!join.localhost_warning;dialog.showModal()}
+  catch(e){status(e.message,true)}finally{$('connectPhone').disabled=false}
+}
 function stopCamera(){clearInterval(state.timer);state.timer=null;state.stream?.getTracks().forEach(track=>{track.onended=null;track.stop()});state.stream=null;$('startCamera').disabled=false;$('stopCamera').disabled=true;showMedia()}
 async function startCamera(){
   if(!window.isSecureContext){status(`Camera blocked: ${location.origin} is not a secure context. Open localhost on this device or use HTTPS.`,true);return}
@@ -114,7 +118,8 @@ async function ask(question){if(state.busy)return;
 async function init(){const params=new URLSearchParams(location.search);state.sessionId=params.get('session');
   try{if(state.sessionId)await refresh();else{const result=await api('/api/sessions',{method:'POST'});state.sessionId=result.session_id;state.startedEpochMs=result.started_epoch_ms;history.replaceState({},'',`?session=${state.sessionId}`)}$('sessionStatus').textContent='Session ready';window.LectureLensSession={id:state.sessionId,startedEpochMs:state.startedEpochMs};window.dispatchEvent(new CustomEvent('lecturelens:session-ready',{detail:window.LectureLensSession}))}
   catch(e){$('sessionStatus').textContent=e.message;return}
-  $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;$('uploadSlides').onclick=()=>$('slideFiles').click();$('slideFiles').onchange=()=>uploadSlides([...$('slideFiles').files]);
+  $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;$('connectPhone').onclick=openPhoneJoin;$('uploadSlides').onclick=()=>$('slideFiles').click();$('slideFiles').onchange=()=>uploadSlides([...$('slideFiles').files]);
+  $('copyPhoneLink').onclick=async()=>{await navigator.clipboard.writeText($('phoneLink').href);$('copyPhoneLink').firstChild.textContent='Copied '};
   window.addEventListener('lecturelens:transcript',()=>{if(state.stream&&Date.now()-state.lastCaptureAt>=2000)void capture('caption')});
   window.addEventListener('lecturelens:translation-language',event=>{const language=event.detail?.language;if(language&&[...$('language').options].some(option=>option.value===language))$('language').value=language});
   $('copyLink').onclick=async()=>{await navigator.clipboard.writeText(location.href);$('copyLink').textContent='Copied ✓';setTimeout(()=>$('copyLink').textContent='Copy link ↗',1800)};

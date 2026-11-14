@@ -3,16 +3,19 @@ import base64
 import io
 import json
 import os
+import secrets
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
 import pymupdf as fitz
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse
+import qrcode
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
@@ -26,6 +29,7 @@ DB = DATA / "lecturelens.sqlite3"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_SLIDE_UPLOAD = 30 * 1024 * 1024
+PHONE_JOIN_LIFETIME_MS = 6 * 60 * 60 * 1000
 ANSWER_RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -83,7 +87,8 @@ def conn():
 
 with conn() as db:
     db.executescript("""
-    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_epoch_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_epoch_ms INTEGER NOT NULL,
+      join_token TEXT, join_expires_epoch_ms INTEGER);
     CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       captured_at_ms INTEGER NOT NULL, source TEXT NOT NULL, width_px INTEGER NOT NULL,
       height_px INTEGER NOT NULL, path TEXT NOT NULL, deck_id TEXT, slide_number INTEGER,
@@ -120,6 +125,15 @@ with conn() as db:
         INSERT INTO messages SELECT * FROM messages_with_required_snapshot;
         DROP TABLE messages_with_required_snapshot;
         """)
+    session_columns = {row["name"] for row in db.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "join_token" not in session_columns:
+        db.execute("ALTER TABLE sessions ADD COLUMN join_token TEXT")
+    if "join_expires_epoch_ms" not in session_columns:
+        db.execute("ALTER TABLE sessions ADD COLUMN join_expires_epoch_ms INTEGER")
+    now_ms = int(time.time() * 1000)
+    for row in db.execute("SELECT id FROM sessions WHERE join_token IS NULL").fetchall():
+        db.execute("UPDATE sessions SET join_token=?, join_expires_epoch_ms=? WHERE id=?",
+                   (secrets.token_urlsafe(18), now_ms + PHONE_JOIN_LIFETIME_MS, row["id"]))
 
 
 def new_id(prefix):
@@ -131,6 +145,18 @@ def session(db, session_id):
     if not row:
         raise HTTPException(404, "Session not found")
     return row
+
+
+def phone_join_credentials(db, session_id):
+    row = session(db, session_id)
+    now_ms = int(time.time() * 1000)
+    if not row["join_token"] or not row["join_expires_epoch_ms"] or row["join_expires_epoch_ms"] <= now_ms:
+        token = secrets.token_urlsafe(18)
+        expires = now_ms + PHONE_JOIN_LIFETIME_MS
+        db.execute("UPDATE sessions SET join_token=?, join_expires_epoch_ms=? WHERE id=?",
+                   (token, expires, session_id))
+        return token, expires
+    return row["join_token"], row["join_expires_epoch_ms"]
 
 
 def snapshot_public(row):
@@ -165,13 +191,49 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/phone")
+def phone():
+    return FileResponse(ROOT / "static" / "phone.html")
+
+
 @app.post("/api/sessions")
 def create_session():
     sid = new_id("sess")
     started = int(time.time() * 1000)
+    token = secrets.token_urlsafe(18)
     with conn() as db:
-        db.execute("INSERT INTO sessions VALUES (?,?)", (sid, started))
+        db.execute("""INSERT INTO sessions
+                   (id, started_epoch_ms, join_token, join_expires_epoch_ms)
+                   VALUES (?,?,?,?)""",
+                   (sid, started, token, started + PHONE_JOIN_LIFETIME_MS))
     return {"session_id": sid, "started_epoch_ms": started}
+
+
+def phone_capture_url(request, session_id, token):
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/phone?{urlencode({'session': session_id, 'token': token})}"
+
+
+@app.get("/api/sessions/{session_id}/phone-join")
+def phone_join(session_id: str, request: Request):
+    with conn() as db:
+        token, expires = phone_join_credentials(db, session_id)
+    capture_url = phone_capture_url(request, session_id, token)
+    return {"session_id": session_id, "capture_url": capture_url,
+            "qr_url": f"/api/sessions/{session_id}/phone-join-qr",
+            "expires_epoch_ms": expires,
+            "localhost_warning": request.url.hostname in ("127.0.0.1", "localhost", "::1")}
+
+
+@app.get("/api/sessions/{session_id}/phone-join-qr")
+def phone_join_qr(session_id: str, request: Request):
+    with conn() as db:
+        token, _ = phone_join_credentials(db, session_id)
+    image = qrcode.make(phone_capture_url(request, session_id, token))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return Response(output.getvalue(), media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/sessions/{session_id}")
@@ -204,11 +266,18 @@ def get_full_context(session_id: str):
 
 @app.post("/api/sessions/{session_id}/snapshots")
 async def add_snapshot(session_id: str, image: UploadFile = File(...), source: str = Form("camera"),
-                       capture_reason: str = Form("timer")):
-    if source not in ("camera", "screen"):
-        raise HTTPException(422, "source must be camera or screen")
-    if capture_reason not in ("start", "timer", "caption", "manual"):
+                       capture_reason: str = Form("timer"), join_token: str | None = Form(None)):
+    if source not in ("camera", "screen", "phone"):
+        raise HTTPException(422, "source must be camera, screen, or phone")
+    if capture_reason not in ("start", "timer", "caption", "manual", "phone"):
         raise HTTPException(422, "invalid capture reason")
+    if source == "phone":
+        with conn() as db:
+            current = session(db, session_id)
+            valid_token = bool(join_token and current["join_token"] and
+                               secrets.compare_digest(join_token, current["join_token"]))
+            if not valid_token or not current["join_expires_epoch_ms"] or current["join_expires_epoch_ms"] <= int(time.time() * 1000):
+                raise HTTPException(403, "Phone join link is invalid or expired")
     raw = await image.read(MAX_UPLOAD + 1)
     if len(raw) > MAX_UPLOAD:
         raise HTTPException(413, "Image too large")
