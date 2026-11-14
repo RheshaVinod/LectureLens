@@ -293,6 +293,27 @@ def image_part(data):
     return {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(data).decode()}}
 
 
+def nearby_segments(db, session_id, anchor_ms, limit=12):
+    rows = db.execute("""
+        SELECT * FROM segments
+        WHERE session_id=:session_id
+          AND start_ms<=:window_end
+          AND end_ms>=:window_start
+        ORDER BY
+          CASE
+            WHEN end_ms<:anchor THEN :anchor-end_ms
+            WHEN start_ms>:anchor THEN start_ms-:anchor
+            ELSE 0
+          END,
+          ABS(end_ms-:anchor),
+          start_ms DESC
+        LIMIT :limit
+    """, {"session_id": session_id, "window_end": anchor_ms + 15000,
+          "window_start": max(0, anchor_ms - 45000), "anchor": anchor_ms,
+          "limit": limit}).fetchall()
+    return sorted(rows, key=lambda row: row["start_ms"])
+
+
 @app.post("/api/sessions/{session_id}/ask")
 async def ask(session_id: str, body: Question):
     key = os.getenv("GEMINI_API_KEY")
@@ -310,8 +331,7 @@ async def ask(session_id: str, body: Question):
                                   (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
         previous = db.execute("SELECT question, answer_json FROM messages WHERE session_id=? ORDER BY created_at_ms DESC LIMIT 8", (session_id,)).fetchall()
         anchor_ms = body.asked_at_ms if shot["source"] == "slide" and body.asked_at_ms is not None else shot["captured_at_ms"]
-        segments = db.execute("SELECT * FROM segments WHERE session_id=? AND start_ms<=? AND end_ms>=? ORDER BY start_ms LIMIT 12",
-                              (session_id, anchor_ms + 15000, max(0, anchor_ms - 45000))).fetchall()
+        segments = nearby_segments(db, session_id, anchor_ms)
     if body.region and (body.region.x + body.region.width > 1.000001 or body.region.y + body.region.height > 1.000001):
         raise HTTPException(422, "Region extends outside image")
     image_bytes = Path(shot["path"]).read_bytes()
