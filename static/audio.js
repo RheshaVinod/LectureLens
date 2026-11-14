@@ -396,7 +396,7 @@
   }
 
   function beginLocalCapture() {
-    if (state.localCaptureStarted || !state.localReady || !state.stream) return;
+    if (state.localCaptureStarted || !state.localWorker || !state.stream) return;
     state.localCaptureStarted = true;
     state.localContext = new (window.AudioContext || window.webkitAudioContext)();
     const source = state.localContext.createMediaStreamSource(state.stream);
@@ -425,6 +425,7 @@
     await acquireMicrophone();
     if (state.localWorker) return;
     state.localWorker = new Worker("/assets/whisper-worker.js", { type: "module" });
+    beginLocalCapture();
     state.localWorker.onmessage = event => {
       const message = event.data;
       if (message.type === "progress") {
@@ -477,10 +478,11 @@
   }
 
   async function startAudio() {
-    if (!state.session || state.listening) return;
+    if (!state.session) return false;
+    if (state.listening) return true;
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus("Microphone unavailable", "error");
-      return;
+      return false;
     }
     ui.start.disabled = true;
     ui.stop.disabled = false;
@@ -497,6 +499,7 @@
         state.recognition.start();
         setStatus("Browser captions", "live");
       }
+      return true;
     } catch (error) {
       console.error("Could not start microphone:", error);
       setStatus(error.name === "NotAllowedError" ? "Mic blocked" : "Mic unavailable", "error");
@@ -505,6 +508,7 @@
       ui.stop.disabled = true;
       ui.microphone.disabled = false;
       await releaseMicrophone();
+      return false;
     }
   }
 
@@ -527,6 +531,7 @@
     ui.interim.textContent = "";
     setStatus("Stopped");
     void processQueue();
+    return true;
   }
 
   async function connectSession(session) {
@@ -575,4 +580,9 @@
   void populateMicrophones();
   updateSyncStatus();
   if (window.LectureLensSession) void connectSession(window.LectureLensSession);
+  window.LectureLensAudio = {
+    start: startAudio,
+    stop: stopAudio,
+    isListening: () => state.listening,
+  };
 })();

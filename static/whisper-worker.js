@@ -6,23 +6,27 @@ const LANGUAGE_NAMES = {
 };
 
 let transcriber = null;
+let loadPromise = null;
 let transcriptionQueue = Promise.resolve();
 
 async function loadModel() {
   if (transcriber) return;
-  transcriber = await pipeline(
-    "automatic-speech-recognition",
-    "onnx-community/whisper-tiny",
-    {
-      dtype: "q4",
-      progress_callback: progress => self.postMessage({
-        type: "progress",
-        progress: progress.progress,
-        status: progress.status,
-        file: progress.file,
-      }),
-    },
-  );
+  if (!loadPromise) {
+    loadPromise = pipeline(
+      "automatic-speech-recognition",
+      "onnx-community/whisper-tiny",
+      {
+        dtype: "q4",
+        progress_callback: progress => self.postMessage({
+          type: "progress",
+          progress: progress.progress,
+          status: progress.status,
+          file: progress.file,
+        }),
+      },
+    ).then(model => { transcriber = model; });
+  }
+  await loadPromise;
 }
 
 self.onmessage = event => {
