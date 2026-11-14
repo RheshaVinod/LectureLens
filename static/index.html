@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LectureLens — See the idea</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,650&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">◉</span> LectureLens <span class="brand-sub">/ live study companion</span></div>
+    <div class="top-actions"><span id="sessionStatus" class="status-pill">Setting up session</span><button id="copyLink" class="plain-button" title="Copy session link">Copy link ↗</button></div>
+  </header>
+  <main class="layout">
+    <section class="visual-panel">
+      <div class="section-kicker"><span>01 / YOUR VIEW</span><span id="captureStatus">Camera off</span></div>
+      <div class="visual-head"><h1>See the idea.<br><em>Keep the moment.</em></h1><p>Point your camera at the board or lecture screen. LectureLens saves recent moments so you can ask at any time.</p></div>
+      <div class="stage" id="stage">
+        <video id="video" autoplay muted playsinline></video>
+        <img id="snapshot" alt="Latest captured lecture snapshot">
+        <div class="stage-empty" id="stageEmpty"><span class="empty-icon">◎</span><strong>Your lecture view starts here</strong><span>Camera access is only used while capture is on.</span></div>
+        <div id="selection" class="selection" hidden><span>R1</span></div>
+        <div class="stage-badge" id="stageBadge">Waiting for camera</div>
+      </div>
+      <div class="capture-controls"><button id="startCamera" class="primary-button">Start camera <span>↗</span></button><button id="stopCamera" class="secondary-button" disabled>Stop capture</button><button id="selectRegion" class="secondary-button" disabled>Select a region</button><button id="clearRegion" class="text-button" hidden>Clear R1 ×</button></div>
+      <div class="timeline-head"><span>RECENT MOMENTS</span><span id="momentCount">0 snapshots</span></div>
+      <div id="moments" class="moments"><div class="moment-placeholder">Snapshots will appear here every 4 seconds.</div></div>
+      <p class="footnote">Capture stays in your browser until snapshots are sent to this session. Use a secure HTTPS page for camera access.</p>
+    </section>
+    <section class="question-panel">
+      <div class="section-kicker"><span>02 / ASK LECTURELENS</span><span class="live-dot">● READY WHEN YOU ARE</span></div>
+      <div class="question-head"><h2>What did I miss?</h2><p>Ask about what you see, or choose a starting question.</p></div>
+      <div class="preset-grid"><button class="preset" data-question="Can you explain what's happening on the board?">Explain what’s happening <span>↗</span></button><button class="preset" data-question="What does the current equation mean?">Explain the equation <span>↗</span></button><button class="preset" data-question="Summarize the most recent board snapshot.">I missed that <span>↗</span></button></div>
+      <div id="conversation" class="conversation"><div class="welcome"><span class="welcome-icon">✳</span><strong>Clarity, one question at a time.</strong><p>Your answers will appear here with the snapshot they used.</p></div></div>
+      <form id="askForm" class="ask-form"><label for="question">YOUR QUESTION</label><textarea id="question" rows="2" placeholder="Why does this term become zero?"></textarea><div class="ask-bottom"><label class="language-wrap" for="language">Answer in <select id="language"><option value="en">English</option><option value="hi">हिन्दी</option></select></label><button id="askButton" class="primary-button" type="submit">Ask about this moment <span>→</span></button></div></form>
+    </section>
+  </main>
+  <canvas id="captureCanvas" hidden></canvas>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
