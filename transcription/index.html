@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>LectureLens — Live Transcription</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>LectureLens</h1>
+    <p class="subtitle">Live captions, in your language.</p>
+  </header>
+
+  <main>
+    <div id="compatibilityNotice" class="notice hidden" role="alert"></div>
+
+    <section class="controls">
+      <label>
+        Lecture is spoken in
+        <select id="sourceLang">
+          <option value="en-US">English (US)</option>
+          <option value="es-ES">Spanish</option>
+          <option value="fr-FR">French</option>
+          <option value="zh-CN">Chinese (Mandarin)</option>
+          <option value="hi-IN">Hindi</option>
+          <option value="ko-KR">Korean</option>
+          <option value="ja-JP">Japanese</option>
+          <option value="de-DE">German</option>
+          <option value="pt-BR">Portuguese</option>
+          <option value="ar-SA">Arabic</option>
+        </select>
+      </label>
+
+      <label>
+        Show translation in
+        <select id="targetLang">
+          <option value="">None (captions only)</option>
+          <option value="es">Spanish</option>
+          <option value="fr">French</option>
+          <option value="zh">Chinese</option>
+          <option value="hi">Hindi</option>
+          <option value="ko">Korean</option>
+          <option value="ja">Japanese</option>
+          <option value="de">German</option>
+          <option value="pt">Portuguese</option>
+          <option value="ar">Arabic</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+
+      <button id="startBtn">Start listening</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="missedBtn" disabled title="Show the last thing that was said">I missed that</button>
+
+      <span id="status" class="status" aria-live="polite">idle</span>
+    </section>
+
+    <section class="captions-wrap">
+      <div class="caption-col">
+        <h2>Live captions</h2>
+        <div id="finalCaptions" class="captions"></div>
+        <div id="interimCaption" class="interim"></div>
+      </div>
+      <div class="caption-col">
+        <h2>Translation</h2>
+        <div id="translatedCaptions" class="captions"></div>
+      </div>
+    </section>
+
+    <div id="missedPanel" class="missed-panel hidden">
+      <h3>You missed:</h3>
+      <p id="missedText"></p>
+      <button id="closeMissed">Close</button>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
