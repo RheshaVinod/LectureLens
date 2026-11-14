@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = {sessionId:null,startedEpochMs:null,stream:null,timer:null,snapshots:[],selected:null,region:null,selecting:false,pinned:false,busy:false,messages:[]};
+const state = {sessionId:null,startedEpochMs:null,stream:null,timer:null,snapshots:[],selected:null,region:null,selecting:false,pinned:false,busy:false,captureInFlight:false,lastCaptureAt:0,messages:[]};
 
 function status(message, error=false){ $('captureStatus').textContent=message; $('captureStatus').style.color=error?'#a34534':''; if(error||message.startsWith('Requesting'))$('stageBadge').textContent=message; }
 async function api(path, options={}){
@@ -49,16 +49,17 @@ async function refresh(){
     if(data.messages.length!==state.messages.length){state.messages=data.messages;renderMessages()}
   }catch(e){status(e.message,true)}
 }
-async function capture(){
-  if(!state.stream||!$('video').videoWidth)return;
-  const canvas=$('captureCanvas'),video=$('video');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
-  canvas.getContext('2d').drawImage(video,0,0);const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.82));
-  if(!blob)return;const form=new FormData();form.append('image',blob,'snapshot.jpg');form.append('source','camera');
-  try{const shot=await api(`/api/sessions/${state.sessionId}/snapshots`,{method:'POST',body:form});
+async function capture(reason='timer'){
+  if(!state.stream||!$('video').videoWidth||state.captureInFlight)return;
+  state.captureInFlight=true;state.lastCaptureAt=Date.now();
+  try{const canvas=$('captureCanvas'),video=$('video');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+    canvas.getContext('2d').drawImage(video,0,0);const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.82));
+    if(!blob)return;const form=new FormData();form.append('image',blob,'snapshot.jpg');form.append('source','camera');form.append('capture_reason',reason);
+    const shot=await api(`/api/sessions/${state.sessionId}/snapshots`,{method:'POST',body:form});
     state.snapshots.unshift(shot);state.snapshots=state.snapshots.slice(0,12);
     if(!state.pinned&&!state.region&&!state.selecting)selectSnapshot(shot);else renderMoments();
-    status(`Capturing · latest at ${elapsed(shot.captured_at_ms)}`)
-  }catch(e){status(e.message,true)}
+    status(`${reason==='caption'?'Caption-linked snapshot':'Capturing'} · ${elapsed(shot.captured_at_ms)}`)
+  }catch(e){status(e.message,true)}finally{state.captureInFlight=false}
 }
 async function uploadSlides(files){if(!files.length)return;const form=new FormData();for(const file of files)form.append('files',file);$('uploadSlides').disabled=true;status('Uploading lecture slides…');
   try{const data=await api(`/api/sessions/${state.sessionId}/slides`,{method:'POST',body:form});state.snapshots=[...data.slides,...state.snapshots];if(data.slides.length)selectSnapshot(data.slides[0],true);renderMoments();status(`${data.slides.length} slide${data.slides.length===1?'':'s'} added to lecture context`)}
@@ -72,7 +73,7 @@ async function startCamera(){
   try{const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}});
     state.stream=stream;const video=$('video');video.srcObject=stream;await video.play();
     stream.getVideoTracks()[0].onended=stopCombined;$('startCamera').disabled=true;$('stopCamera').disabled=false;
-    status('Capturing every 4 seconds');showMedia();await capture();state.timer=setInterval(capture,4000)
+    status('Capturing every 4 seconds');showMedia();await capture('start');state.timer=setInterval(()=>void capture('timer'),4000)
   }catch(e){
     state.stream?.getTracks().forEach(track=>track.stop());state.stream=null;$('startCamera').disabled=false;
     const detail=e.name==='NotAllowedError'?'Camera permission was blocked. Allow camera access in your browser, then try again.':
@@ -114,6 +115,7 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   try{if(state.sessionId)await refresh();else{const result=await api('/api/sessions',{method:'POST'});state.sessionId=result.session_id;state.startedEpochMs=result.started_epoch_ms;history.replaceState({},'',`?session=${state.sessionId}`)}$('sessionStatus').textContent='Session ready';window.LectureLensSession={id:state.sessionId,startedEpochMs:state.startedEpochMs};window.dispatchEvent(new CustomEvent('lecturelens:session-ready',{detail:window.LectureLensSession}))}
   catch(e){$('sessionStatus').textContent=e.message;return}
   $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;$('uploadSlides').onclick=()=>$('slideFiles').click();$('slideFiles').onchange=()=>uploadSlides([...$('slideFiles').files]);
+  window.addEventListener('lecturelens:transcript',()=>{if(state.stream&&Date.now()-state.lastCaptureAt>=2000)void capture('caption')});
   $('copyLink').onclick=async()=>{await navigator.clipboard.writeText(location.href);$('copyLink').textContent='Copied ✓';setTimeout(()=>$('copyLink').textContent='Copy link ↗',1800)};
   $('selectRegion').onclick=()=>{state.selecting=!state.selecting;if(state.selecting)state.pinned=true;$('stage').classList.toggle('selecting',state.selecting);$('selectRegion').textContent=state.selecting?'Drag on the snapshot':'Select a region';showMedia()};
   $('useLatest').onclick=()=>{if(state.snapshots.length)selectSnapshot(state.snapshots[0]);};

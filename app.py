@@ -26,6 +26,19 @@ DB = DATA / "lecturelens.sqlite3"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_SLIDE_UPLOAD = 30 * 1024 * 1024
+ANSWER_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "answer": {"type": "STRING"},
+        "visible_evidence": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "inferred_explanation": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "uncertainties": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "transcript_segment_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "status": {"type": "STRING", "enum": ["supported", "partial", "unsupported"]},
+    },
+    "required": ["answer", "visible_evidence", "inferred_explanation", "uncertainties",
+                 "transcript_segment_ids", "status"],
+}
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
 app = FastAPI(title="LectureLens")
@@ -48,7 +61,8 @@ with conn() as db:
     CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_epoch_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       captured_at_ms INTEGER NOT NULL, source TEXT NOT NULL, width_px INTEGER NOT NULL,
-      height_px INTEGER NOT NULL, path TEXT NOT NULL, deck_id TEXT, slide_number INTEGER);
+      height_px INTEGER NOT NULL, path TEXT NOT NULL, deck_id TEXT, slide_number INTEGER,
+      capture_reason TEXT NOT NULL DEFAULT 'timer');
     CREATE TABLE IF NOT EXISTS segments (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, speaker TEXT NOT NULL,
       language TEXT NOT NULL, text TEXT NOT NULL, translated_text TEXT,
@@ -67,6 +81,8 @@ with conn() as db:
         db.execute("ALTER TABLE snapshots ADD COLUMN deck_id TEXT")
     if "slide_number" not in snapshot_columns:
         db.execute("ALTER TABLE snapshots ADD COLUMN slide_number INTEGER")
+    if "capture_reason" not in snapshot_columns:
+        db.execute("ALTER TABLE snapshots ADD COLUMN capture_reason TEXT NOT NULL DEFAULT 'timer'")
 
 
 def new_id(prefix):
@@ -85,10 +101,12 @@ def snapshot_public(row):
             "captured_at_ms": row["captured_at_ms"], "source": row["source"],
             "width_px": row["width_px"], "height_px": row["height_px"],
             "deck_id": row["deck_id"], "slide_number": row["slide_number"],
+            "capture_reason": row["capture_reason"],
             "image_url": f"/api/snapshots/{row['id']}/image"}
 
 
-def save_snapshot(db, session_id, picture, source, captured_at_ms=None, deck_id=None, slide_number=None):
+def save_snapshot(db, session_id, picture, source, captured_at_ms=None, deck_id=None,
+                  slide_number=None, capture_reason="timer"):
     started = session(db, session_id)["started_epoch_ms"]
     timestamp = max(0, int(time.time() * 1000) - started) if captured_at_ms is None else captured_at_ms
     picture = picture.convert("RGB")
@@ -97,10 +115,11 @@ def save_snapshot(db, session_id, picture, source, captured_at_ms=None, deck_id=
     path = DATA / f"{sid}.jpg"
     picture.save(path, "JPEG", quality=88)
     db.execute("""INSERT INTO snapshots
-               (id, session_id, captured_at_ms, source, width_px, height_px, path, deck_id, slide_number)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (id, session_id, captured_at_ms, source, width_px, height_px, path, deck_id,
+                slide_number, capture_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
                (sid, session_id, timestamp, source, picture.width, picture.height,
-                str(path), deck_id, slide_number))
+                str(path), deck_id, slide_number, capture_reason))
     return db.execute("SELECT * FROM snapshots WHERE id=?", (sid,)).fetchone()
 
 
@@ -145,9 +164,12 @@ def get_full_context(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/snapshots")
-async def add_snapshot(session_id: str, image: UploadFile = File(...), source: str = Form("camera")):
+async def add_snapshot(session_id: str, image: UploadFile = File(...), source: str = Form("camera"),
+                       capture_reason: str = Form("timer")):
     if source not in ("camera", "screen"):
         raise HTTPException(422, "source must be camera or screen")
+    if capture_reason not in ("start", "timer", "caption", "manual"):
+        raise HTTPException(422, "invalid capture reason")
     raw = await image.read(MAX_UPLOAD + 1)
     if len(raw) > MAX_UPLOAD:
         raise HTTPException(413, "Image too large")
@@ -160,7 +182,7 @@ async def add_snapshot(session_id: str, image: UploadFile = File(...), source: s
     if picture.width < 320 or picture.height < 180:
         raise HTTPException(422, "Image is too small")
     with conn() as db:
-        row = save_snapshot(db, session_id, picture, source)
+        row = save_snapshot(db, session_id, picture, source, capture_reason=capture_reason)
     return snapshot_public(row)
 
 
@@ -198,7 +220,7 @@ async def add_slides(session_id: str, files: list[UploadFile] = File(...)):
         session(db, session_id)
         uploaded_at_ms = max(0, int(time.time() * 1000) - session(db, session_id)["started_epoch_ms"])
         rows = [save_snapshot(db, session_id, picture, "slide", uploaded_at_ms,
-                              deck_id, index + 1)
+                              deck_id, index + 1, "slide-upload")
                 for index, picture in enumerate(pictures)]
     return {"deck_id": deck_id, "slides": [snapshot_public(row) for row in rows]}
 
@@ -313,7 +335,8 @@ async def ask(session_id: str, body: Question):
         parts.append({"text": "Selected region R1, enlarged:"})
         parts.append(image_part(crop.getvalue()))
     payload = {"contents": [{"role": "user", "parts": parts}],
-               "generationConfig": {"responseMimeType": "application/json"}}
+               "generationConfig": {"responseMimeType": "application/json",
+                                    "responseSchema": ANSWER_RESPONSE_SCHEMA}}
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             res = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
