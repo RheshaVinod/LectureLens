@@ -24,6 +24,15 @@ SAMPLE_RECAP = {
     "next_steps": ["Practice one limit problem."],
 }
 
+SAMPLE_ANSWER = {
+    "answer": "The professor explained that the limit approaches zero.",
+    "visible_evidence": ["This should be removed in transcript-only mode."],
+    "inferred_explanation": ["The transcript states the result."],
+    "uncertainties": [],
+    "transcript_segment_ids": [],
+    "status": "supported",
+}
+
 
 class FakeResponse:
     def raise_for_status(self):
@@ -47,6 +56,16 @@ class FakeAsyncClient:
         return FakeResponse()
 
 
+class FakeAskResponse(FakeResponse):
+    def json(self):
+        return {"candidates": [{"content": {"parts": [{"text": json.dumps(SAMPLE_ANSWER)}]}}]}
+
+
+class FakeAskAsyncClient(FakeAsyncClient):
+    async def post(self, *_args, **_kwargs):
+        return FakeAskResponse()
+
+
 class RecapApiTest(unittest.TestCase):
     def setUp(self):
         self.session_id = f"sess_test_{uuid.uuid4().hex}"
@@ -63,8 +82,22 @@ class RecapApiTest(unittest.TestCase):
     def tearDown(self):
         with lecture_app.conn() as db:
             db.execute("DELETE FROM recaps WHERE session_id=?", (self.session_id,))
+            db.execute("DELETE FROM messages WHERE session_id=?", (self.session_id,))
             db.execute("DELETE FROM segments WHERE session_id=?", (self.session_id,))
             db.execute("DELETE FROM sessions WHERE id=?", (self.session_id,))
+
+    @patch.object(lecture_app.httpx, "AsyncClient", FakeAskAsyncClient)
+    def test_answer_from_audio_transcript_without_snapshot(self):
+        response = self.client.post(f"/api/sessions/{self.session_id}/ask", json={
+            "question": "Explain what the professor just said.",
+            "language": "en",
+            "asked_at_ms": 100000,
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        message = response.json()
+        self.assertIsNone(message["snapshot_id"])
+        self.assertEqual(message["result"]["visible_evidence"], [])
+        self.assertIn("limit approaches zero", message["result"]["answer"])
 
     @patch.object(lecture_app.httpx, "AsyncClient", FakeAsyncClient)
     def test_generate_persist_and_download_markdown_recap(self):

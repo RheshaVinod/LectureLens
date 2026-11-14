@@ -31,6 +31,6 @@ All times are integer milliseconds since session creation. The audio pipeline au
 - `GET /api/sessions/{session_id}/recaps` — list every saved recap for the lecture.
 - `GET /api/recaps/{recap_id}/markdown` — download a recap as a Markdown study guide.
 
-For camera captures, questions retrieve transcript around the snapshot timestamp. For uploaded slides, the question time becomes the transcript anchor. Nearby timestamps are candidate context, not proof that spoken words refer to a particular visual region.
+For camera captures, questions retrieve transcript around the snapshot timestamp. For uploaded slides, the question time becomes the transcript anchor. If no snapshot exists, questions still work from nearby audio transcript segments alone and the response is explicitly marked as transcript-only evidence. Nearby timestamps are candidate context, not proof that spoken words refer to a particular visual region.
 
 Study recaps combine the session transcript and translations, visual timeline, up to six representative snapshots/slides, and prior student Q&A. The structured result contains key concepts with lecture timestamps, important visuals, formulas and terms, review questions with answers, unresolved questions, and suggested next steps.

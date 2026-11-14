@@ -18,7 +18,7 @@ function showMedia(){
   $('selectRegion').disabled=!state.snapshots.length;
   $('useLatest').hidden=!state.pinned;
   const selectedLabel=state.selected?.source==='slide'?`Slide ${state.selected.slide_number}`:`capture ${elapsed(state.selected?.captured_at_ms||0)}`;
-  $('selectedMoment').textContent=state.pinned&&state.selected?`Selected ${selectedLabel}${state.region?' · Region R1':''} — held while you type`:state.selected?.source==='slide'?`Using ${selectedLabel}`:state.selected?'Using the latest capture as it updates':'Start camera or upload slides';
+  $('selectedMoment').textContent=state.pinned&&state.selected?`Selected ${selectedLabel}${state.region?' · Region R1':''} — held while you type`:state.selected?.source==='slide'?`Using ${selectedLabel}`:state.selected?'Using the latest capture as it updates':'Using live transcript context · camera optional';
   drawRegion();
 }
 function drawRegion(){
@@ -100,14 +100,14 @@ let dragStart=null;
 function renderMessages(){const root=$('conversation');root.replaceChildren();if(!state.messages.length){root.innerHTML='<div class="welcome"><span class="welcome-icon">✳</span><strong>Clarity, one question at a time.</strong><p>Your answers will appear here with the snapshot they used.</p></div>';return}
   for(const message of state.messages){const entry=document.createElement('article');entry.className='entry';const q=document.createElement('div');q.className='entry-question';q.textContent=message.question;
     const a=document.createElement('div');a.className='entry-answer';a.textContent=message.result.answer;
-    const meta=document.createElement('div');meta.className='entry-meta';const shot=state.snapshots.find(s=>s.snapshot_id===message.snapshot_id);const thumb=document.createElement('img');thumb.src=`/api/snapshots/${message.snapshot_id}/image`;thumb.alt='Evidence snapshot';const label=document.createElement('span');label.textContent=shot?`Snapshot ${elapsed(shot.captured_at_ms)}${message.region?' · Region R1':''}`:`Evidence snapshot${message.region?' · Region R1':''}`;
+    const meta=document.createElement('div');meta.className='entry-meta';const shot=state.snapshots.find(s=>s.snapshot_id===message.snapshot_id);const label=document.createElement('span');label.textContent=shot?`Snapshot ${elapsed(shot.captured_at_ms)}${message.region?' · Region R1':''}`:'Audio transcript context';
     const sources=message.result.source_timestamps||[];const sourceLabel=sources.length?` · Transcript ${sources.map(s=>`${elapsed(s.start_ms)}–${elapsed(s.end_ms)}`).join(', ')}`:'';label.textContent+=sourceLabel;
-    meta.append(thumb,label);meta.onclick=()=>{if(shot){selectSnapshot(shot,true);state.region=message.region;showMedia()}};meta.style.cursor='pointer';entry.append(q,a,meta);
+    if(shot){const thumb=document.createElement('img');thumb.src=`/api/snapshots/${message.snapshot_id}/image`;thumb.alt='Evidence snapshot';meta.append(thumb);meta.onclick=()=>{selectSnapshot(shot,true);state.region=message.region;showMedia()};meta.style.cursor='pointer'}meta.append(label);entry.append(q,a,meta);
     for(const [title,list] of [['Visible',message.result.visible_evidence],['Explanation',message.result.inferred_explanation],['Uncertain',message.result.uncertainties]]){if(Array.isArray(list)&&list.length){const line=document.createElement('div');line.className='evidence';const strong=document.createElement('strong');strong.textContent=title+' · ';line.append(strong,document.createTextNode(list.join(' · ')));entry.append(line)}}root.append(entry)}root.scrollTop=root.scrollHeight;
 }
-async function ask(question){if(state.busy)return;if(!state.snapshots.length){status('Start camera capture first',true);return}
-  state.busy=true;$('askButton').disabled=true;$('askButton').firstChild.textContent='Thinking… ';const shot=state.selected||state.snapshots[0];
-  const askedAtMs=Math.max(0,Date.now()-state.startedEpochMs);try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:$('language').value,snapshot_id:shot.snapshot_id,region:state.region,asked_at_ms:askedAtMs})});state.messages.push(message);renderMessages();$('question').value=''}
+async function ask(question){if(state.busy)return;
+  state.busy=true;$('askButton').disabled=true;$('askButton').firstChild.textContent='Thinking… ';const shot=state.selected||state.snapshots[0]||null;
+  const askedAtMs=Math.max(0,Date.now()-state.startedEpochMs);try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:$('language').value,snapshot_id:shot?.snapshot_id||null,region:shot?state.region:null,asked_at_ms:askedAtMs})});state.messages.push(message);renderMessages();$('question').value=''}
   catch(e){const error=document.createElement('p');error.className='error';error.textContent=e.message;$('conversation').append(error);$('conversation').scrollTop=$('conversation').scrollHeight}
   finally{state.busy=false;$('askButton').disabled=false;$('askButton').firstChild.textContent='Ask about this moment '}
 }

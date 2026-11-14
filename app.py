@@ -110,6 +110,16 @@ with conn() as db:
         db.execute("ALTER TABLE snapshots ADD COLUMN slide_number INTEGER")
     if "capture_reason" not in snapshot_columns:
         db.execute("ALTER TABLE snapshots ADD COLUMN capture_reason TEXT NOT NULL DEFAULT 'timer'")
+    message_columns = {row["name"]: row for row in db.execute("PRAGMA table_info(messages)").fetchall()}
+    if message_columns["snapshot_id"]["notnull"]:
+        db.executescript("""
+        ALTER TABLE messages RENAME TO messages_with_required_snapshot;
+        CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+          snapshot_id TEXT, region_json TEXT, question TEXT NOT NULL,
+          answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+        INSERT INTO messages SELECT * FROM messages_with_required_snapshot;
+        DROP TABLE messages_with_required_snapshot;
+        """)
 
 
 def new_id(prefix):
@@ -354,32 +364,48 @@ async def ask(session_id: str, body: Question):
         raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable answers")
     with conn() as db:
         session(db, session_id)
+        shot = None
         if body.snapshot_id:
             shot = db.execute("SELECT * FROM snapshots WHERE id=? AND session_id=?", (body.snapshot_id, session_id)).fetchone()
+            if not shot:
+                raise HTTPException(404, "Snapshot not found in this lecture")
         else:
             shot = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms DESC LIMIT 1", (session_id,)).fetchone()
-        if not shot:
-            raise HTTPException(409, "No snapshots yet. Start camera capture first")
-        recent_shots = db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
-                                  (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
+        recent_shots = (db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
+                                   (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
+                        if shot else [])
         previous = db.execute("SELECT question, answer_json FROM messages WHERE session_id=? ORDER BY created_at_ms DESC LIMIT 8", (session_id,)).fetchall()
-        anchor_ms = body.asked_at_ms if shot["source"] == "slide" and body.asked_at_ms is not None else shot["captured_at_ms"]
+        latest_segment = db.execute("SELECT end_ms FROM segments WHERE session_id=? ORDER BY end_ms DESC LIMIT 1",
+                                    (session_id,)).fetchone()
+        if shot:
+            anchor_ms = body.asked_at_ms if shot["source"] == "slide" and body.asked_at_ms is not None else shot["captured_at_ms"]
+        else:
+            anchor_ms = body.asked_at_ms if body.asked_at_ms is not None else (latest_segment["end_ms"] if latest_segment else 0)
         segments = nearby_segments(db, session_id, anchor_ms)
+        if not shot and not segments and latest_segment:
+            anchor_ms = latest_segment["end_ms"]
+            segments = nearby_segments(db, session_id, anchor_ms)
+    if not shot and not segments:
+        raise HTTPException(409, "No transcript or visual context is available yet")
+    if body.region and not shot:
+        raise HTTPException(422, "A selected region requires a snapshot")
     if body.region and (body.region.x + body.region.width > 1.000001 or body.region.y + body.region.height > 1.000001):
         raise HTTPException(422, "Region extends outside image")
-    image_bytes = Path(shot["path"]).read_bytes()
-    parts = [{"text": "You are LectureLens, a classroom visual companion. Answer the student's question in the requested language. Use the supplied board image as visual evidence. Preserve mathematical symbols exactly; if illegible, say so. Distinguish what is visible from what is inferred or stated by a transcript. Never treat nearby timestamps as proof of a visual reference. Do not invent details. Return concise JSON with answer, visible_evidence (array of short strings), inferred_explanation (array of short strings), uncertainties (array of short strings), transcript_segment_ids (array of IDs actually used), and status (supported, partial, or unsupported).\n" +
+    image_bytes = Path(shot["path"]).read_bytes() if shot else None
+    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. Use a supplied board image as visual evidence when one is present; otherwise answer solely from the transcript and leave visible_evidence empty. Preserve mathematical symbols exactly; if illegible or missing, say so. Distinguish what is visible from what is inferred or stated by a transcript. Never treat nearby timestamps as proof of a visual reference. Do not invent details. Return concise JSON with answer, visible_evidence (array of short strings), inferred_explanation (array of short strings), uncertainties (array of short strings), transcript_segment_ids (array of IDs actually used), and status (supported, partial, or unsupported).\n" +
              json.dumps({"question": body.question, "language": body.language,
                          "region_label": "R1" if body.region else None,
                          "region_bbox_normalized": body.region.model_dump() if body.region else None,
-                         "snapshot_at_ms": shot["captured_at_ms"], "context_anchor_ms": anchor_ms,
+                         "context_mode": "visual_and_transcript" if shot else "transcript_only",
+                         "snapshot_at_ms": shot["captured_at_ms"] if shot else None, "context_anchor_ms": anchor_ms,
                          "transcript": [dict(s) for s in segments],
-                         "recent_conversation": [{"question": r["question"], "answer": json.loads(r["answer_json"]).get("answer", "")} for r in reversed(previous)]}, ensure_ascii=False)},
-             image_part(image_bytes)]
+                         "recent_conversation": [{"question": r["question"], "answer": json.loads(r["answer_json"]).get("answer", "")} for r in reversed(previous)]}, ensure_ascii=False)}]
+    if image_bytes:
+        parts.append(image_part(image_bytes))
     for older in reversed(recent_shots):
         parts.append({"text": f"Earlier snapshot at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
         parts.append(image_part(Path(older["path"]).read_bytes()))
-    if body.region:
+    if body.region and image_bytes:
         im = Image.open(io.BytesIO(image_bytes))
         r = body.region
         box = (round(r.x * im.width), round(r.y * im.height), round((r.x+r.width)*im.width), round((r.y+r.height)*im.height))
@@ -404,17 +430,17 @@ async def ask(session_id: str, body: Question):
     used_segment_ids = [s for s in result.get("transcript_segment_ids", []) if s in {r["id"] for r in segments}]
     source_timestamps = [{"segment_id": row["id"], "start_ms": row["start_ms"], "end_ms": row["end_ms"]}
                          for row in segments if row["id"] in used_segment_ids]
-    result = {"answer": result["answer"], "visible_evidence": result.get("visible_evidence", []),
+    result = {"answer": result["answer"], "visible_evidence": result.get("visible_evidence", []) if shot else [],
               "inferred_explanation": result.get("inferred_explanation", []),
               "uncertainties": result.get("uncertainties", []),
               "transcript_segment_ids": used_segment_ids,
               "source_timestamps": source_timestamps,
-              "snapshot_at_ms": shot["captured_at_ms"],
+              "snapshot_at_ms": shot["captured_at_ms"] if shot else None,
               "status": result.get("status", "partial") if result.get("status") in ("supported", "partial", "unsupported") else "partial"}
     with conn() as db:
         ident = new_id("msg")
         db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
-                   (ident, session_id, shot["id"], body.region.model_dump_json() if body.region else None,
+                   (ident, session_id, shot["id"] if shot else None, body.region.model_dump_json() if body.region else None,
                     body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000)))
         row = db.execute("SELECT * FROM messages WHERE id=?", (ident,)).fetchone()
     return message_public(row)
