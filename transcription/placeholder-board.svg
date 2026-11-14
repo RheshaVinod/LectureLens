@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">Sample calculus board</title>
+  <desc id="desc">A white lecture board showing a limit equation and an explanatory diagram.</desc>
+  <rect width="1200" height="675" fill="#f5f3e9"/>
+  <g stroke="#ddd9c9" stroke-width="1">
+    <path d="M0 90H1200M0 180H1200M0 270H1200M0 360H1200M0 450H1200M0 540H1200M0 630H1200"/>
+  </g>
+  <g fill="#26354a" font-family="Georgia, serif">
+    <text x="70" y="85" font-size="32" font-family="Arial, sans-serif" font-weight="700">Limits and small-angle approximation</text>
+    <text x="100" y="205" font-size="50">lim</text>
+    <text x="102" y="238" font-size="20">x → 0</text>
+    <text x="205" y="215" font-size="58">sin(x)</text>
+    <line x1="195" y1="232" x2="390" y2="232" stroke="#26354a" stroke-width="3"/>
+    <text x="275" y="290" font-size="58">x</text>
+    <text x="430" y="235" font-size="62">= 1</text>
+    <text x="92" y="405" font-size="34">sin(x) ≈ x − x³/6</text>
+    <text x="92" y="470" font-size="30">As x approaches zero, the x³ term vanishes faster.</text>
+  </g>
+  <g transform="translate(770 155)">
+    <path d="M0 350H350M35 390V0" stroke="#526275" stroke-width="3"/>
+    <path d="M35 350C115 345 175 275 225 190C270 112 310 65 345 48" fill="none" stroke="#3478c9" stroke-width="7"/>
+    <path d="M35 350L345 45" fill="none" stroke="#d45f52" stroke-width="4" stroke-dasharray="14 10"/>
+    <text x="240" y="160" fill="#3478c9" font-family="Arial, sans-serif" font-size="24">y = sin(x)</text>
+    <text x="245" y="80" fill="#d45f52" font-family="Arial, sans-serif" font-size="24">y = x</text>
+  </g>
+  <text x="70" y="625" fill="#77808b" font-family="Arial, sans-serif" font-size="22">Demo snapshot — drag over any equation or diagram to ask a question</text>
+</svg>

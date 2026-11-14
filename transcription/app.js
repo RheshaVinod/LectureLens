@@ -17,6 +17,16 @@ const missedPanel = document.getElementById("missedPanel");
 const missedText = document.getElementById("missedText");
 const closeMissed = document.getElementById("closeMissed");
 const compatibilityNotice = document.getElementById("compatibilityNotice");
+const snapshotStage = document.getElementById("snapshotStage");
+const boardSnapshot = document.getElementById("boardSnapshot");
+const selectionBox = document.getElementById("selectionBox");
+const selectionStatus = document.getElementById("selectionStatus");
+const clearSelectionBtn = document.getElementById("clearSelectionBtn");
+const snapshotMeta = document.getElementById("snapshotMeta");
+const questionForm = document.getElementById("questionForm");
+const questionInput = document.getElementById("questionInput");
+const questionLanguage = document.getElementById("questionLanguage");
+const questionStatus = document.getElementById("questionStatus");
 
 const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
 const forceLocalRecognition = new URLSearchParams(window.location.search).get("local") === "1";
@@ -25,6 +35,7 @@ const forceLocalRecognition = new URLSearchParams(window.location.search).get("l
 // array — each entry is a self-contained record with a timestamp.
 // Shape: { id, text, lang, startedAt (Date), translated }
 window.LectureLensTranscript = [];
+window.LectureLensQuestions = window.LectureLensQuestions || [];
 
 let recognition = null;
 let listening = false; // intentional on/off, used to decide whether to auto-restart
@@ -464,3 +475,142 @@ missedBtn.addEventListener("click", () => {
 closeMissed.addEventListener("click", () => {
   missedPanel.classList.add("hidden");
 });
+
+// Select-and-ask ------------------------------------------------------------
+// Vision can call window.LectureLensSetSnapshot(snapshot), or set
+// window.LectureLensLatestSnapshot and dispatch `lecturelens:snapshot`.
+const demoSnapshot = {
+  id: "demo-snapshot",
+  sessionId: "demo-session",
+  imageUrl: "placeholder-board.svg",
+  capturedAt: new Date(),
+  capturedAtMs: 0,
+};
+
+let selectedRegion = null;
+let selectionStart = null;
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function clearSelection() {
+  selectedRegion = null;
+  selectionStart = null;
+  selectionBox.classList.add("hidden");
+  selectionBox.removeAttribute("style");
+  clearSelectionBtn.disabled = true;
+  selectionStatus.textContent = "Drag over the equation or diagram you want to ask about.";
+}
+
+function setLatestSnapshot(snapshot) {
+  if (!snapshot?.id || !snapshot?.imageUrl) {
+    console.warn("Ignored invalid LectureLens snapshot:", snapshot);
+    return;
+  }
+  window.LectureLensLatestSnapshot = snapshot;
+  boardSnapshot.src = snapshot.imageUrl;
+  snapshotMeta.textContent = snapshot.capturedAt
+    ? `Captured ${new Date(snapshot.capturedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+    : "Latest snapshot";
+  clearSelection();
+}
+
+function pointInStage(event) {
+  const rect = snapshotStage.getBoundingClientRect();
+  return {
+    x: clamp(event.clientX - rect.left, 0, rect.width),
+    y: clamp(event.clientY - rect.top, 0, rect.height),
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function drawSelection(current) {
+  const left = Math.min(selectionStart.x, current.x);
+  const top = Math.min(selectionStart.y, current.y);
+  const width = Math.abs(current.x - selectionStart.x);
+  const height = Math.abs(current.y - selectionStart.y);
+  Object.assign(selectionBox.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+  });
+  selectionBox.classList.remove("hidden");
+  return { left, top, width, height, stageWidth: current.width, stageHeight: current.height };
+}
+
+snapshotStage.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  snapshotStage.setPointerCapture(event.pointerId);
+  selectionStart = pointInStage(event);
+  drawSelection(selectionStart);
+  questionStatus.textContent = "";
+});
+
+snapshotStage.addEventListener("pointermove", (event) => {
+  if (!selectionStart || !snapshotStage.hasPointerCapture(event.pointerId)) return;
+  drawSelection(pointInStage(event));
+});
+
+snapshotStage.addEventListener("pointerup", (event) => {
+  if (!selectionStart) return;
+  const box = drawSelection(pointInStage(event));
+  selectionStart = null;
+  if (box.width < 8 || box.height < 8) {
+    clearSelection();
+    selectionStatus.textContent = "Selection was too small. Drag a larger region.";
+    return;
+  }
+  selectedRegion = {
+    x: Number((box.left / box.stageWidth).toFixed(4)),
+    y: Number((box.top / box.stageHeight).toFixed(4)),
+    width: Number((box.width / box.stageWidth).toFixed(4)),
+    height: Number((box.height / box.stageHeight).toFixed(4)),
+  };
+  clearSelectionBtn.disabled = false;
+  selectionStatus.textContent = "Region selected. Add your question and choose an answer language.";
+});
+
+snapshotStage.addEventListener("pointercancel", clearSelection);
+clearSelectionBtn.addEventListener("click", clearSelection);
+
+questionForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  questionStatus.classList.remove("error");
+  const question = questionInput.value.trim();
+  const snapshot = window.LectureLensLatestSnapshot;
+
+  if (!selectedRegion) {
+    questionStatus.textContent = "Select a board region first.";
+    questionStatus.classList.add("error");
+    return;
+  }
+  if (!snapshot) {
+    questionStatus.textContent = "No board snapshot is available yet.";
+    questionStatus.classList.add("error");
+    return;
+  }
+
+  const payload = {
+    id: window.crypto?.randomUUID?.() || `question-${Date.now()}`,
+    sessionId: snapshot.sessionId,
+    snapshotId: snapshot.id,
+    selectedRegion: { ...selectedRegion },
+    question,
+    language: questionLanguage.value,
+    askedAt: new Date(),
+    askedAtMs: Math.round(performance.now()),
+  };
+
+  window.LectureLensQuestions.push(payload);
+  window.dispatchEvent(new CustomEvent("lecturelens:question", { detail: payload }));
+  questionStatus.textContent = "Question queued for the multimodal AI.";
+  questionInput.value = "";
+});
+
+window.LectureLensSetSnapshot = setLatestSnapshot;
+window.addEventListener("lecturelens:snapshot", (event) => setLatestSnapshot(event.detail));
+setLatestSnapshot(window.LectureLensLatestSnapshot || demoSnapshot);
