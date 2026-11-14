@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>LectureLens — Live Transcription</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>LectureLens</h1>
+    <p class="subtitle">Live captions, in your language.</p>
+  </header>
+
+  <main>
+    <div id="compatibilityNotice" class="notice hidden" role="alert"></div>
+
+    <section class="controls">
+      <label>
+        Lecture is spoken in
+        <select id="sourceLang">
+          <option value="en-US">English (US)</option>
+          <option value="es-ES">Spanish</option>
+          <option value="fr-FR">French</option>
+          <option value="zh-CN">Chinese (Mandarin)</option>
+          <option value="hi-IN">Hindi</option>
+          <option value="ko-KR">Korean</option>
+          <option value="ja-JP">Japanese</option>
+          <option value="de-DE">German</option>
+          <option value="pt-BR">Portuguese</option>
+          <option value="ar-SA">Arabic</option>
+        </select>
+      </label>
+
+      <label>
+        Show translation in
+        <select id="targetLang">
+          <option value="">None (captions only)</option>
+          <option value="es">Spanish</option>
+          <option value="fr">French</option>
+          <option value="zh">Chinese</option>
+          <option value="hi">Hindi</option>
+          <option value="ko">Korean</option>
+          <option value="ja">Japanese</option>
+          <option value="de">German</option>
+          <option value="pt">Portuguese</option>
+          <option value="ar">Arabic</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+
+      <button id="startBtn">Start listening</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="missedBtn" disabled title="Show the last thing that was said">I missed that</button>
+
+      <span id="status" class="status" aria-live="polite">idle</span>
+    </section>
+
+    <section class="captions-wrap">
+      <div class="caption-col">
+        <h2>Live captions</h2>
+        <div id="finalCaptions" class="captions"></div>
+        <div id="interimCaption" class="interim"></div>
+      </div>
+      <div class="caption-col">
+        <h2>Translation</h2>
+        <div id="translatedCaptions" class="captions"></div>
+      </div>
+    </section>
+
+    <section class="ask-section" aria-labelledby="askHeading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Visual context</p>
+          <h2 id="askHeading">Select a board region and ask</h2>
+        </div>
+        <span id="snapshotMeta" class="snapshot-meta">Demo snapshot</span>
+      </div>
+
+      <div class="ask-layout">
+        <div>
+          <div id="snapshotStage" class="snapshot-stage" aria-label="Board snapshot. Drag to select a region.">
+            <img id="boardSnapshot" src="placeholder-board.svg" alt="Latest lecture board snapshot" draggable="false" />
+            <div id="selectionBox" class="selection-box hidden" aria-hidden="true"></div>
+          </div>
+          <div class="selection-help">
+            <span id="selectionStatus" aria-live="polite">Drag over the equation or diagram you want to ask about.</span>
+            <button id="clearSelectionBtn" class="text-button" type="button" disabled>Clear selection</button>
+          </div>
+        </div>
+
+        <form id="questionForm" class="question-form">
+          <label for="questionInput">Your question</label>
+          <textarea id="questionInput" rows="5" placeholder="Why does this term approach zero?" required></textarea>
+
+          <label for="questionLanguage">Answer in</label>
+          <select id="questionLanguage">
+            <option value="en">English</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="zh">Chinese</option>
+            <option value="hi">Hindi</option>
+            <option value="ko">Korean</option>
+            <option value="ja">Japanese</option>
+            <option value="de">German</option>
+            <option value="pt">Portuguese</option>
+            <option value="ar">Arabic</option>
+          </select>
+
+          <button id="askQuestionBtn" type="submit">Ask about selection</button>
+          <p id="questionStatus" class="question-status" aria-live="polite"></p>
+        </form>
+      </div>
+    </section>
+
+    <div id="missedPanel" class="missed-panel hidden">
+      <h3>You missed:</h3>
+      <p id="missedText"></p>
+      <button id="closeMissed">Close</button>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
