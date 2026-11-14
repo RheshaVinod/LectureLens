@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,650&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/audio.css">
   <style>.selected-moment{margin-bottom:14px;padding:10px 12px;border:1px solid #cadbbc;border-radius:7px;background:#eef5df;color:#355e40;font-size:12px;font-weight:700}</style>
 </head>
 <body>
@@ -26,20 +27,40 @@
         <div id="selection" class="selection" hidden><span>R1</span></div>
         <div class="stage-badge" id="stageBadge">Waiting for camera</div>
       </div>
-      <div class="capture-controls"><button id="startCamera" class="primary-button">Start camera <span>↗</span></button><button id="stopCamera" class="secondary-button" disabled>Stop capture</button><button id="selectRegion" class="secondary-button" disabled>Select a region</button><button id="useLatest" class="secondary-button" hidden>Use latest capture ↻</button><button id="clearRegion" class="text-button" hidden>Clear R1 ×</button></div>
-      <div class="timeline-head"><span>RECENT MOMENTS</span><span id="momentCount">0 snapshots</span></div>
+      <div class="capture-controls"><button id="startCamera" class="primary-button">Start camera <span>↗</span></button><button id="stopCamera" class="secondary-button" disabled>Stop capture</button><button id="uploadSlides" class="secondary-button">Upload slides</button><input id="slideFiles" type="file" accept="application/pdf,image/*" multiple hidden><button id="selectRegion" class="secondary-button" disabled>Select a region</button><button id="useLatest" class="secondary-button" hidden>Use latest capture ↻</button><button id="clearRegion" class="text-button" hidden>Clear R1 ×</button></div>
+      <div class="timeline-head"><span>LECTURE CONTEXT · SNAPSHOTS + SLIDES</span><span id="momentCount">0 snapshots</span></div>
       <div id="moments" class="moments"><div class="moment-placeholder">Snapshots will appear here every 4 seconds.</div></div>
       <p class="footnote">Capture stays in your browser until snapshots are sent to this session. Use a secure HTTPS page for camera access.</p>
     </section>
     <section class="question-panel">
       <div class="section-kicker"><span>02 / ASK LECTURELENS</span><span class="live-dot">● READY WHEN YOU ARE</span></div>
+      <section class="audio-card" aria-labelledby="audioTitle">
+        <div class="audio-card-head">
+          <div><span class="audio-kicker">LIVE LECTURE AUDIO</span><h2 id="audioTitle">Hear every explanation.</h2></div>
+          <span id="audioStatus" class="audio-status">Idle</span>
+        </div>
+        <div class="audio-settings">
+          <label>Spoken language<select id="audioLanguage"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="fr-FR">French</option><option value="zh-CN">Chinese</option><option value="hi-IN">Hindi</option><option value="ko-KR">Korean</option><option value="ja-JP">Japanese</option><option value="de-DE">German</option><option value="pt-BR">Portuguese</option><option value="ar-SA">Arabic</option></select></label>
+          <label>Translate captions<select id="captionLanguage"><option value="">No translation</option><option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="zh">Chinese</option><option value="hi">Hindi</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="de">German</option><option value="pt">Portuguese</option><option value="ar">Arabic</option></select></label>
+          <label>Microphone<select id="microphone"><option value="">System default</option></select></label>
+        </div>
+        <div class="audio-actions">
+          <button id="startAudio" class="primary-button" type="button">Start captions <span>↗</span></button>
+          <button id="stopAudio" class="secondary-button" type="button" disabled>Stop</button>
+          <div class="level-wrap"><span>INPUT</span><div class="level-track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="levelFill"></div></div></div>
+          <span id="audioSync" class="audio-sync">Context ready</span>
+        </div>
+        <div id="liveTranscript" class="live-transcript"><p class="transcript-empty">Final captions will appear here and sync to this lecture session.</p></div>
+        <div id="interimTranscript" class="interim-transcript" aria-live="polite"></div>
+      </section>
       <div class="question-head"><h2>What did I miss?</h2><p>Ask about what you see, or choose a starting question.</p></div>
       <div class="preset-grid"><button class="preset" data-question="Can you explain what's happening on the board?">Explain what’s happening <span>↗</span></button><button class="preset" data-question="What does the current equation mean?">Explain the equation <span>↗</span></button><button class="preset" data-question="Summarize the most recent board snapshot.">I missed that <span>↗</span></button></div>
       <div id="conversation" class="conversation"><div class="welcome"><span class="welcome-icon">✳</span><strong>Clarity, one question at a time.</strong><p>Your answers will appear here with the snapshot they used.</p></div></div>
-      <form id="askForm" class="ask-form"><div id="selectedMoment" class="selected-moment">Using the latest capture as it updates</div><label for="question">YOUR QUESTION</label><textarea id="question" rows="2" placeholder="Why does this term become zero?"></textarea><div class="ask-bottom"><label class="language-wrap" for="language">Answer in <select id="language"><option value="en">English</option><option value="hi">हिन्दी</option></select></label><button id="askButton" class="primary-button" type="submit">Ask about this moment <span>→</span></button></div></form>
+      <form id="askForm" class="ask-form"><div id="selectedMoment" class="selected-moment">Using the latest capture as it updates</div><label for="question">YOUR QUESTION</label><textarea id="question" rows="2" placeholder="Why does this term become zero?"></textarea><div class="ask-bottom"><label class="language-wrap" for="language">Answer in <select id="language"><option value="en">English</option><option value="es">Español</option><option value="fr">Français</option><option value="zh">中文</option><option value="hi">हिन्दी</option><option value="ko">한국어</option><option value="ja">日本語</option><option value="de">Deutsch</option><option value="pt">Português</option><option value="ar">العربية</option></select></label><button id="askButton" class="primary-button" type="submit">Ask about this moment <span>→</span></button></div></form>
     </section>
   </main>
   <canvas id="captureCanvas" hidden></canvas>
   <script src="/assets/app.js"></script>
+  <script src="/assets/audio.js"></script>
 </body>
 </html>
