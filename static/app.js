@@ -107,7 +107,7 @@ function renderMessages(){const root=$('conversation');root.replaceChildren();if
 }
 async function ask(question){if(state.busy)return;
   state.busy=true;$('askButton').disabled=true;$('askButton').firstChild.textContent='Thinking… ';const shot=state.selected||state.snapshots[0]||null;
-  const askedAtMs=Math.max(0,Date.now()-state.startedEpochMs);try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:$('language').value,snapshot_id:shot?.snapshot_id||null,region:shot?state.region:null,asked_at_ms:askedAtMs})});state.messages.push(message);renderMessages();$('question').value=''}
+  const answerLanguage=$('captionLanguage')?.value||$('language').value;const askedAtMs=Math.max(0,Date.now()-state.startedEpochMs);try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:answerLanguage,snapshot_id:shot?.snapshot_id||null,region:shot?state.region:null,asked_at_ms:askedAtMs})});state.messages.push(message);renderMessages();$('question').value=''}
   catch(e){const error=document.createElement('p');error.className='error';error.textContent=e.message;$('conversation').append(error);$('conversation').scrollTop=$('conversation').scrollHeight}
   finally{state.busy=false;$('askButton').disabled=false;$('askButton').firstChild.textContent='Ask about this moment '}
 }
@@ -116,6 +116,7 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   catch(e){$('sessionStatus').textContent=e.message;return}
   $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;$('uploadSlides').onclick=()=>$('slideFiles').click();$('slideFiles').onchange=()=>uploadSlides([...$('slideFiles').files]);
   window.addEventListener('lecturelens:transcript',()=>{if(state.stream&&Date.now()-state.lastCaptureAt>=2000)void capture('caption')});
+  window.addEventListener('lecturelens:translation-language',event=>{const language=event.detail?.language;if(language&&[...$('language').options].some(option=>option.value===language))$('language').value=language});
   $('copyLink').onclick=async()=>{await navigator.clipboard.writeText(location.href);$('copyLink').textContent='Copied ✓';setTimeout(()=>$('copyLink').textContent='Copy link ↗',1800)};
   $('selectRegion').onclick=()=>{state.selecting=!state.selecting;if(state.selecting)state.pinned=true;$('stage').classList.toggle('selecting',state.selecting);$('selectRegion').textContent=state.selecting?'Drag on the snapshot':'Select a region';showMedia()};
   $('useLatest').onclick=()=>{if(state.snapshots.length)selectSnapshot(state.snapshots[0]);};

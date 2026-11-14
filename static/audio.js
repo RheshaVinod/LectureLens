@@ -573,6 +573,11 @@
       try { state.recognition.stop(); } catch {}
     }
   });
+  ui.target.addEventListener("change", () => {
+    window.dispatchEvent(new CustomEvent("lecturelens:translation-language", {
+      detail: { language: ui.target.value },
+    }));
+  });
   window.addEventListener("online", () => void processQueue());
   window.addEventListener("offline", () => updateSyncStatus());
   window.addEventListener("lecturelens:session-ready", event => void connectSession(event.detail));

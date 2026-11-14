@@ -19,7 +19,7 @@ The model ID defaults to `gemini-3.6-flash`; override with server-side `GEMINI_M
 {"segment_id":"seg_demo_1","start_ms":12000,"end_ms":17000,"speaker":"lecturer","language":"en","text":"This term approaches zero."}
 ```
 
-All times are integer milliseconds since session creation. The audio pipeline automatically posts final segments, retries when offline, and updates translated text using the same segment ID. Camera snapshots and uploaded slide pages share the session context. Region coordinates are normalized to the image, with top-left origin: `{x,y,width,height}` in `[0,1]`.
+All times are integer milliseconds since session creation. The audio pipeline automatically posts final segments, retries when offline, and updates translated text using the same segment ID. The selected caption-translation language also becomes the default language for Explain and Q&A responses. Camera snapshots and uploaded slide pages share the session context. Region coordinates are normalized to the image, with top-left origin: `{x,y,width,height}` in `[0,1]`.
 
 - `POST /api/sessions/{session_id}/transcript` — idempotent transcript segment upload.
 - `POST /api/sessions/{session_id}/snapshots` — timestamped camera/screen image.
