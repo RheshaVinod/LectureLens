@@ -1,6 +1,6 @@
 # LectureLens visual prototype
 
-Each student points their camera at the board or lecture screen. The browser captures a snapshot every four seconds. A question uses the selected or latest snapshot; students can draw a box to focus on one region. Answers retain the evidence snapshot for follow-ups. Transcript segments can be posted later by the audio pipeline.
+Each student points their camera at the board or lecture screen. The browser captures a snapshot every four seconds. Click any thumbnail under **Recent moments** to hold that capture while typing a question; **Use latest capture** returns to the live view. Students can also draw a box to focus on one region. Answers retain the evidence snapshot for follow-ups. Transcript segments can be posted later by the audio pipeline.
 
 ## Run
 

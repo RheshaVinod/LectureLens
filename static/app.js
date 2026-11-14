@@ -10,12 +10,14 @@ async function api(path, options={}){
 }
 function elapsed(ms){const s=Math.floor(ms/1000);return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
 function showMedia(){
-  const live=!!state.stream && !state.region && !state.selecting && state.selected?.snapshot_id===state.snapshots[0]?.snapshot_id;
+  const live=!!state.stream && !state.pinned && !state.region && !state.selecting;
   $('video').classList.toggle('active',live);
   $('snapshot').classList.toggle('active',!!state.selected);
   $('stageEmpty').hidden=!!state.stream||!!state.selected;
   $('stageBadge').textContent=live?'● LIVE CAMERA':state.selected?`SNAPSHOT · ${elapsed(state.selected.captured_at_ms)}`:state.stream?'● LIVE CAMERA':'Waiting for camera';
   $('selectRegion').disabled=!state.snapshots.length;
+  $('useLatest').hidden=!state.pinned;
+  $('selectedMoment').textContent=state.pinned&&state.selected?`Selected capture ${elapsed(state.selected.captured_at_ms)}${state.region?' · Region R1':''} — held while you type`:state.selected?'Using the latest capture as it updates':'Start camera to capture a moment';
   drawRegion();
 }
 function drawRegion(){
@@ -33,7 +35,7 @@ function renderMoments(){
   if(!state.snapshots.length){const p=document.createElement('div');p.className='moment-placeholder';p.textContent='Snapshots will appear here every 4 seconds.';target.append(p);return}
   for(const shot of state.snapshots){const button=document.createElement('button');button.className='moment'+(state.selected?.snapshot_id===shot.snapshot_id?' active':'');button.title=`Snapshot at ${elapsed(shot.captured_at_ms)}`;
     const img=document.createElement('img');img.src=shot.image_url;img.alt=button.title;const label=document.createElement('span');label.textContent=elapsed(shot.captured_at_ms);button.append(img,label);
-    button.onclick=()=>selectSnapshot(shot,shot.snapshot_id!==state.snapshots[0].snapshot_id);target.append(button)}
+    button.onclick=()=>selectSnapshot(shot,true);target.append(button)}
 }
 function selectSnapshot(shot,pinned=false){state.selected=shot;state.pinned=pinned;state.region=null;state.selecting=false;$('selectRegion').textContent='Select a region';$('stage').classList.remove('selecting');$('snapshot').src=shot.image_url;$('clearRegion').hidden=true;showMedia();renderMoments()}
 async function refresh(){
@@ -85,7 +87,7 @@ function renderMessages(){const root=$('conversation');root.replaceChildren();if
   for(const message of state.messages){const entry=document.createElement('article');entry.className='entry';const q=document.createElement('div');q.className='entry-question';q.textContent=message.question;
     const a=document.createElement('div');a.className='entry-answer';a.textContent=message.result.answer;
     const meta=document.createElement('div');meta.className='entry-meta';const shot=state.snapshots.find(s=>s.snapshot_id===message.snapshot_id);const thumb=document.createElement('img');thumb.src=`/api/snapshots/${message.snapshot_id}/image`;thumb.alt='Evidence snapshot';const label=document.createElement('span');label.textContent=shot?`Snapshot ${elapsed(shot.captured_at_ms)}${message.region?' · Region R1':''}`:`Evidence snapshot${message.region?' · Region R1':''}`;
-    meta.append(thumb,label);meta.onclick=()=>{if(shot){selectSnapshot(shot);state.region=message.region;drawRegion()}};meta.style.cursor='pointer';entry.append(q,a,meta);
+    meta.append(thumb,label);meta.onclick=()=>{if(shot){selectSnapshot(shot,true);state.region=message.region;showMedia()}};meta.style.cursor='pointer';entry.append(q,a,meta);
     for(const [title,list] of [['Visible',message.result.visible_evidence],['Explanation',message.result.inferred_explanation],['Uncertain',message.result.uncertainties]]){if(Array.isArray(list)&&list.length){const line=document.createElement('div');line.className='evidence';const strong=document.createElement('strong');strong.textContent=title+' · ';line.append(strong,document.createTextNode(list.join(' · ')));entry.append(line)}}root.append(entry)}root.scrollTop=root.scrollHeight;
 }
 async function ask(question){if(state.busy)return;if(!state.snapshots.length){status('Start camera capture first',true);return}
@@ -100,14 +102,15 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   $('startCamera').onclick=start;$('stopCamera').onclick=stop;
   $('copyLink').onclick=async()=>{await navigator.clipboard.writeText(location.href);$('copyLink').textContent='Copied ✓';setTimeout(()=>$('copyLink').textContent='Copy link ↗',1800)};
   $('selectRegion').onclick=()=>{state.selecting=!state.selecting;if(state.selecting)state.pinned=true;$('stage').classList.toggle('selecting',state.selecting);$('selectRegion').textContent=state.selecting?'Drag on the snapshot':'Select a region';showMedia()};
-  $('clearRegion').onclick=()=>{state.region=null;state.pinned=false;$('clearRegion').hidden=true;if(state.snapshots.length)selectSnapshot(state.snapshots[0]);else drawRegion()};
+  $('useLatest').onclick=()=>{if(state.snapshots.length)selectSnapshot(state.snapshots[0]);};
+  $('clearRegion').onclick=()=>{state.region=null;$('clearRegion').hidden=true;showMedia()};
   $('stage').addEventListener('pointerdown',e=>{if(!state.selecting||!state.selected)return;dragStart=imagePoint(e);$('stage').setPointerCapture(e.pointerId)});
   $('stage').addEventListener('pointermove',e=>{if(!dragStart)return;const p=imagePoint(e);state.region={x:Math.min(p.x,dragStart.x),y:Math.min(p.y,dragStart.y),width:Math.abs(p.x-dragStart.x),height:Math.abs(p.y-dragStart.y)};drawRegion()});
-  $('stage').addEventListener('pointerup',e=>{if(!dragStart)return;dragStart=null;if(state.region.width<.01||state.region.height<.01){state.region=null;drawRegion();return}state.selecting=false;$('stage').classList.remove('selecting');$('selectRegion').textContent='Select a region';$('clearRegion').hidden=false});
+  $('stage').addEventListener('pointerup',e=>{if(!dragStart)return;dragStart=null;if(state.region.width<.01||state.region.height<.01){state.region=null;drawRegion();return}state.selecting=false;$('stage').classList.remove('selecting');$('selectRegion').textContent='Select a region';$('clearRegion').hidden=false;showMedia()});
   window.addEventListener('resize',drawRegion);
   document.querySelectorAll('.preset').forEach(button=>button.onclick=()=>{
     if(button.textContent.includes('I missed that')&&state.messages.length){const last=state.messages[state.messages.length-1];
-      const shot=state.snapshots.find(s=>s.snapshot_id===last.snapshot_id);if(shot){selectSnapshot(shot);state.region=last.region;drawRegion()}
+      const shot=state.snapshots.find(s=>s.snapshot_id===last.snapshot_id);if(shot){selectSnapshot(shot,true);state.region=last.region;showMedia()}
       $('conversation').scrollTop=$('conversation').scrollHeight;return}
     ask(button.dataset.question)
   });
