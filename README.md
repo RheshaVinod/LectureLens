@@ -26,5 +26,11 @@ All times are integer milliseconds since session creation. The audio pipeline au
 - `POST /api/sessions/{session_id}/slides` — PDF or image slide deck upload.
 - `GET /api/sessions/{session_id}/context` — full transcript, snapshot/slide, and Q&A history.
 - `POST /api/sessions/{session_id}/ask` — `{question,language,snapshot_id,region,asked_at_ms}`.
+- `POST /api/sessions/{session_id}/recap` — generate and persist a grounded study recap with `{language}`.
+- `GET /api/sessions/{session_id}/recap` — retrieve the latest generated recap.
+- `GET /api/sessions/{session_id}/recaps` — list every saved recap for the lecture.
+- `GET /api/recaps/{recap_id}/markdown` — download a recap as a Markdown study guide.
 
 For camera captures, questions retrieve transcript around the snapshot timestamp. For uploaded slides, the question time becomes the transcript anchor. Nearby timestamps are candidate context, not proof that spoken words refer to a particular visual region.
+
+Study recaps combine the session transcript and translations, visual timeline, up to six representative snapshots/slides, and prior student Q&A. The structured result contains key concepts with lecture timestamps, important visuals, formulas and terms, review questions with answers, unresolved questions, and suggested next steps.

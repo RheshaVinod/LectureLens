@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pymupdf as fitz
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
@@ -38,6 +38,31 @@ ANSWER_RESPONSE_SCHEMA = {
     },
     "required": ["answer", "visible_evidence", "inferred_explanation", "uncertainties",
                  "transcript_segment_ids", "status"],
+}
+RECAP_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "overview": {"type": "STRING"},
+        "key_concepts": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "concept": {"type": "STRING"}, "explanation": {"type": "STRING"},
+            "evidence_timestamps_ms": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+        }, "required": ["concept", "explanation", "evidence_timestamps_ms"]}},
+        "important_visuals": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "snapshot_id": {"type": "STRING"}, "timestamp_ms": {"type": "INTEGER"},
+            "description": {"type": "STRING"},
+        }, "required": ["snapshot_id", "timestamp_ms", "description"]}},
+        "formulas_and_terms": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "item": {"type": "STRING"}, "explanation": {"type": "STRING"},
+        }, "required": ["item", "explanation"]}},
+        "review_questions": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "question": {"type": "STRING"}, "answer": {"type": "STRING"},
+        }, "required": ["question", "answer"]}},
+        "unresolved_questions": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "next_steps": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["title", "overview", "key_concepts", "important_visuals",
+                 "formulas_and_terms", "review_questions", "unresolved_questions", "next_steps"],
 }
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
@@ -70,6 +95,8 @@ with conn() as db:
     CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       snapshot_id TEXT NOT NULL, region_json TEXT, question TEXT NOT NULL,
       answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS recaps (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+      language TEXT NOT NULL, recap_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
     """)
     columns = {row["name"] for row in db.execute("PRAGMA table_info(segments)").fetchall()}
     if "translated_text" not in columns:
@@ -157,10 +184,12 @@ def get_full_context(session_id: str):
         snapshots = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms, slide_number", (session_id,)).fetchall()
         segments = db.execute("SELECT * FROM segments WHERE session_id=? ORDER BY start_ms", (session_id,)).fetchall()
         messages = db.execute("SELECT * FROM messages WHERE session_id=? ORDER BY created_at_ms", (session_id,)).fetchall()
+        recaps = db.execute("SELECT * FROM recaps WHERE session_id=? ORDER BY created_at_ms", (session_id,)).fetchall()
     return {"session_id": session_id, "started_epoch_ms": current["started_epoch_ms"],
             "transcripts": [dict(row) for row in segments],
             "snapshots": [snapshot_public(row) for row in snapshots],
-            "messages": [message_public(row) for row in messages]}
+            "messages": [message_public(row) for row in messages],
+            "recaps": [recap_public(row) for row in recaps]}
 
 
 @app.post("/api/sessions/{session_id}/snapshots")
@@ -258,6 +287,10 @@ class Segment(BaseModel):
     text: str = Field(min_length=1)
     translated_text: str | None = None
     translated_language: str | None = None
+
+
+class RecapRequest(BaseModel):
+    language: str = Field(default="en", pattern="^(en|es|fr|zh|hi|ko|ja|de|pt|ar)$")
 
 
 @app.post("/api/sessions/{session_id}/transcript")
@@ -385,3 +418,160 @@ async def ask(session_id: str, body: Question):
                     body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000)))
         row = db.execute("SELECT * FROM messages WHERE id=?", (ident,)).fetchone()
     return message_public(row)
+
+
+def representative_snapshots(rows, limit=6):
+    rows = list(rows)
+    if len(rows) <= limit:
+        return rows
+    slides = [row for row in rows if row["source"] == "slide"]
+    cameras = [row for row in rows if row["source"] != "slide"]
+
+    def sample(items, count):
+        if count <= 0 or not items:
+            return []
+        if len(items) <= count:
+            return items
+        return [items[round(index * (len(items) - 1) / (count - 1))]
+                for index in range(count)] if count > 1 else [items[-1]]
+
+    slide_count = min(3, len(slides))
+    chosen = sample(slides, slide_count) + sample(cameras, limit - slide_count)
+    return sorted(chosen, key=lambda row: (row["captured_at_ms"], row["slide_number"] or 0))
+
+
+def recap_public(row):
+    return {"recap_id": row["id"], "session_id": row["session_id"],
+            "language": row["language"], "created_at_ms": row["created_at_ms"],
+            "recap": json.loads(row["recap_json"]),
+            "markdown_url": f"/api/recaps/{row['id']}/markdown"}
+
+
+def elapsed_label(milliseconds):
+    seconds = max(0, int(milliseconds) // 1000)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def recap_markdown(recap):
+    lines = [f"# {recap.get('title', 'Lecture recap')}", "", recap.get("overview", ""), ""]
+    lines.extend(["## Key concepts", ""])
+    for item in recap.get("key_concepts", []):
+        times = ", ".join(elapsed_label(value) for value in item.get("evidence_timestamps_ms", []))
+        evidence = f" _(lecture: {times})_" if times else ""
+        lines.append(f"- **{item.get('concept', '')}** — {item.get('explanation', '')}{evidence}")
+    lines.extend(["", "## Important visuals", ""])
+    for item in recap.get("important_visuals", []):
+        lines.append(f"- **{elapsed_label(item.get('timestamp_ms', 0))}** — {item.get('description', '')} "
+                     f"(`{item.get('snapshot_id', '')}`)")
+    lines.extend(["", "## Formulas and terms", ""])
+    for item in recap.get("formulas_and_terms", []):
+        lines.append(f"- **{item.get('item', '')}** — {item.get('explanation', '')}")
+    lines.extend(["", "## Review questions", ""])
+    for index, item in enumerate(recap.get("review_questions", []), 1):
+        lines.extend([f"{index}. **{item.get('question', '')}**", f"   {item.get('answer', '')}"])
+    lines.extend(["", "## Unresolved questions", ""])
+    lines.extend(f"- {item}" for item in recap.get("unresolved_questions", []))
+    lines.extend(["", "## Next steps", ""])
+    lines.extend(f"- {item}" for item in recap.get("next_steps", []))
+    return "\n".join(lines).strip() + "\n"
+
+
+@app.post("/api/sessions/{session_id}/recap")
+async def create_recap(session_id: str, body: RecapRequest):
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to generate a recap")
+    with conn() as db:
+        session(db, session_id)
+        segments = db.execute("SELECT * FROM segments WHERE session_id=? ORDER BY start_ms",
+                              (session_id,)).fetchall()
+        snapshots = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms, slide_number",
+                               (session_id,)).fetchall()
+        messages = db.execute("SELECT * FROM messages WHERE session_id=? ORDER BY created_at_ms",
+                              (session_id,)).fetchall()
+    if not segments and not snapshots and not messages:
+        raise HTTPException(409, "This lecture has no context to summarize yet")
+
+    transcript_lines = [
+        f"[{row['id']} {row['start_ms']}-{row['end_ms']}ms {row['language']}] {row['text']}" +
+        (f" | translation ({row['translated_language']}): {row['translated_text']}"
+         if row["translated_text"] else "")
+        for row in segments
+    ]
+    transcript_text = "\n".join(transcript_lines)
+    if len(transcript_text) > 120_000:
+        transcript_text = transcript_text[:60_000] + "\n...[middle transcript omitted]...\n" + transcript_text[-60_000:]
+    visual_metadata = [snapshot_public(row) for row in snapshots]
+    qa_history = [{"question": row["question"],
+                   "answer": json.loads(row["answer_json"]).get("answer", "")}
+                  for row in messages[-40:]]
+    parts = [{"text": "Create a grounded study recap in the requested language from this lecture context. "
+                      "Use only supplied evidence; do not invent topics, formulas, or definitions. Preserve "
+                      "mathematical notation. Attach session-relative millisecond timestamps to key concepts. "
+                      "Important visuals must use supplied snapshot IDs. Turn uncertainties and unanswered "
+                      "student questions into unresolved_questions. Return only the requested structured JSON.\n" +
+                      json.dumps({"language": body.language, "transcript": transcript_text,
+                                  "visual_timeline": visual_metadata,
+                                  "student_questions_and_answers": qa_history}, ensure_ascii=False)}]
+    for shot in representative_snapshots(snapshots):
+        label = f"Representative {shot['source']} {shot['id']} at {shot['captured_at_ms']} ms"
+        if shot["slide_number"]:
+            label += f", slide {shot['slide_number']}"
+        parts.extend([{"text": label + ":"}, image_part(Path(shot["path"]).read_bytes())])
+    payload = {"contents": [{"role": "user", "parts": parts}],
+               "generationConfig": {"responseMimeType": "application/json",
+                                    "responseSchema": RECAP_RESPONSE_SCHEMA}}
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
+                headers={"x-goog-api-key": key}, json=payload)
+        response.raise_for_status()
+        content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        recap = json.loads(content)
+        if not isinstance(recap.get("title"), str) or not isinstance(recap.get("overview"), str):
+            raise ValueError("Invalid recap")
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(502, f"Recap generation failed: {type(exc).__name__}. Check server logs and model access")
+
+    valid_snapshot_ids = {row["id"] for row in snapshots}
+    recap["important_visuals"] = [item for item in recap.get("important_visuals", [])
+                                    if item.get("snapshot_id") in valid_snapshot_ids]
+    with conn() as db:
+        recap_id = new_id("recap")
+        db.execute("INSERT INTO recaps VALUES (?,?,?,?,?)",
+                   (recap_id, session_id, body.language, json.dumps(recap, ensure_ascii=False),
+                    int(time.time() * 1000)))
+        row = db.execute("SELECT * FROM recaps WHERE id=?", (recap_id,)).fetchone()
+    return recap_public(row)
+
+
+@app.get("/api/sessions/{session_id}/recap")
+def latest_recap(session_id: str):
+    with conn() as db:
+        session(db, session_id)
+        row = db.execute("SELECT * FROM recaps WHERE session_id=? ORDER BY created_at_ms DESC LIMIT 1",
+                         (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "No recap has been generated for this lecture")
+    return recap_public(row)
+
+
+@app.get("/api/sessions/{session_id}/recaps")
+def list_recaps(session_id: str):
+    with conn() as db:
+        session(db, session_id)
+        rows = db.execute("SELECT * FROM recaps WHERE session_id=? ORDER BY created_at_ms DESC",
+                          (session_id,)).fetchall()
+    return {"session_id": session_id, "recaps": [recap_public(row) for row in rows]}
+
+
+@app.get("/api/recaps/{recap_id}/markdown")
+def download_recap(recap_id: str):
+    with conn() as db:
+        row = db.execute("SELECT * FROM recaps WHERE id=?", (recap_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Recap not found")
+    recap = json.loads(row["recap_json"])
+    return PlainTextResponse(recap_markdown(recap), media_type="text/markdown",
+                             headers={"Content-Disposition": "attachment; filename=lecture-recap.md"})
