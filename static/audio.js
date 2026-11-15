@@ -100,7 +100,7 @@
 
   function updateSyncStatus(count = readQueue().length) {
     ui.sync.className = `audio-sync ${count ? "pending" : "synced"}`;
-    ui.sync.textContent = count ? `${count} segment${count === 1 ? "" : "s"} pending` : "Context synced";
+    ui.sync.textContent = count ? `${count} pending` : "Synced";
   }
 
   function enqueueTranscript(entry) {

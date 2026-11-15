@@ -328,7 +328,9 @@ function stopRecordingIndicator(){
 }
 function setTranscriptCollapsed(collapsed){
   document.querySelector('.audio-card').classList.toggle('transcript-collapsed',collapsed);
-  $('transcriptToggle').textContent=collapsed?'Show transcript':'Hide transcript';
+  $('transcriptToggle').textContent=collapsed?'⌄':'⌃';
+  $('transcriptToggle').setAttribute('aria-label',collapsed?'Show transcript':'Hide transcript');
+  $('transcriptToggle').title=collapsed?'Show transcript':'Hide transcript';
   $('transcriptToggle').setAttribute('aria-expanded',String(!collapsed));
   localStorage.setItem('lecturelens-transcript-collapsed',String(collapsed));
 }
