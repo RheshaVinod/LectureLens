@@ -2,6 +2,7 @@ services:
   - type: web
     name: lecturelens
     runtime: python
+    plan: free
     branch: main
     autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt
