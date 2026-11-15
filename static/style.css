@@ -137,7 +137,7 @@
 .chat-list-empty{margin:1px 0 0;padding:5px 9px 8px}
 .add-class{width:100%;padding:8px 10px;border:0;border-radius:6px;background:none;color:#6e786e;text-align:left;font-size:11px}
 .add-class:hover{background:#e3e8e2;color:#26362b}
-.class-form{padding:8px 9px;border:1px solid #d9dfd8;border-radius:7px;background:#fff}
+.class-form{margin-top:8px;padding:8px 9px;border:1px solid #d9dfd8;border-radius:7px;background:#fff}
 .class-form label{display:block;margin-bottom:5px;color:#69736b;font-size:10px;font-weight:600}
 .class-form input{width:100%;padding:7px;border:1px solid #d2d9d1;border-radius:5px;font:inherit;font-size:11px}
 .class-form div{display:flex;gap:7px;margin-top:7px}

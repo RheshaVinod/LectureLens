@@ -18,11 +18,10 @@
     <aside id="chatSidebar" class="chat-sidebar" aria-label="Chat history">
       <div class="sidebar-rail"><button id="sidebarToggle" class="rail-button rail-chat" type="button" aria-label="Collapse chat sidebar" aria-controls="sidebarContent" aria-expanded="true" title="Toggle chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="chat-bubble" d="M12 3.75c-4.7 0-8.5 3.23-8.5 7.23 0 1.76.74 3.39 1.99 4.65L4.25 20l4.3-1.51c1.05.42 2.22.64 3.45.64 4.7 0 8.5-3.23 8.5-7.2S16.7 3.75 12 3.75Z"/><circle class="chat-dot" cx="9" cy="11.4" r=".8"/><circle class="chat-dot" cx="12" cy="11.4" r=".8"/><circle class="chat-dot" cx="15" cy="11.4" r=".8"/></svg></button></div>
       <div id="sidebarContent" class="sidebar-content">
-        <div class="sidebar-head"><span>YOUR CLASSES</span></div>
-        <button id="newChat" class="new-chat" type="button"><span>＋</span> New chat</button>
-        <nav id="chatList" class="chat-list" aria-label="Chats by class"></nav>
-        <button id="addClass" class="add-class" type="button">＋ Add class</button>
-        <form id="classForm" class="class-form" hidden><label for="className">Class name</label><input id="className" maxlength="60" placeholder="Class name" required><p id="classError" class="class-error" hidden></p><div><button type="submit">Add</button><button id="cancelClass" type="button">Cancel</button></div></form>
+        <div class="sidebar-head"><span>YOUR COURSES</span></div>
+        <button id="addClass" class="new-chat" type="button"><span>＋</span> New course</button>
+        <form id="classForm" class="class-form" hidden><label for="className">Course name</label><input id="className" maxlength="60" placeholder="Course name" required><p id="classError" class="class-error" hidden></p><div><button type="submit">Add course</button><button id="cancelClass" type="button">Cancel</button></div></form>
+        <nav id="chatList" class="chat-list" aria-label="Chats by course"></nav>
         <div class="sidebar-foot">LectureLens · this lecture</div>
       </div>
     </aside>
@@ -42,9 +41,9 @@
       <section class="audio-card" aria-labelledby="audioTitle">
         <div class="audio-card-head"><div><span class="audio-kicker">LIVE LECTURE AUDIO</span><h2 id="audioTitle">Captions + translation</h2></div><span id="audioStatus" class="audio-status">Idle</span></div>
         <div class="audio-settings">
-          <label>Spoken language<select id="audioLanguage"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="fr-FR">French</option><option value="zh-CN">Chinese</option><option value="hi-IN">Hindi</option><option value="ko-KR">Korean</option><option value="ja-JP">Japanese</option><option value="de-DE">German</option><option value="pt-BR">Portuguese</option><option value="ar-SA">Arabic</option></select></label>
-          <label>Translate captions + answers<select id="captionLanguage"><option value="">No translation</option><option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="zh">Chinese</option><option value="hi">Hindi</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="de">German</option><option value="pt">Portuguese</option><option value="ar">Arabic</option></select></label>
-          <label>Microphone<select id="microphone"><option value="">System default</option></select><small class="microphone-hint">A specific mic uses local Whisper.</small></label>
+          <label><span>Spoken language</span><select id="audioLanguage"><option value="en-US">English</option><option value="es-ES">Spanish</option><option value="fr-FR">French</option><option value="zh-CN">Chinese</option><option value="hi-IN">Hindi</option><option value="ko-KR">Korean</option><option value="ja-JP">Japanese</option><option value="de-DE">German</option><option value="pt-BR">Portuguese</option><option value="ar-SA">Arabic</option></select></label>
+          <label><span>Translate to</span><select id="captionLanguage" title="Translate captions and answers"><option value="">Off</option><option value="en">English</option><option value="es">Spanish</option><option value="fr">French</option><option value="zh">Chinese</option><option value="hi">Hindi</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="de">German</option><option value="pt">Portuguese</option><option value="ar">Arabic</option></select></label>
+          <label><span>Microphone</span><select id="microphone"><option value="">Default</option></select><small class="microphone-hint">Specific mic uses local Whisper.</small></label>
         </div>
         <div class="audio-actions"><button id="startAudio" type="button" hidden tabindex="-1" aria-hidden="true">Start captions</button><button id="stopAudio" type="button" hidden tabindex="-1" aria-hidden="true" disabled>Stop captions</button><span class="microphone-hint">Start below runs audio and video together.</span><div class="level-wrap"><span>INPUT</span><div class="level-track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="levelFill"></div></div></div><span id="audioSync" class="audio-sync">Context ready</span></div>
         <div id="liveTranscript" class="live-transcript" role="log" aria-live="polite"><p class="transcript-empty">Final captions will appear here and sync to this lecture.</p></div><div id="interimTranscript" class="interim-transcript" aria-live="polite"></div>

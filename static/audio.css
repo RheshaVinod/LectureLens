@@ -72,9 +72,9 @@
 }
 
 .audio-settings label {
-  display: flex;
+  display: grid;
+  grid-template-rows: 2.5em auto minmax(1.3em, auto);
   min-width: 0;
-  flex-direction: column;
   gap: 4px;
   color: var(--muted);
   font-size: 9px;
@@ -83,6 +83,8 @@
   line-height: 1.25;
   text-transform: uppercase;
 }
+
+.audio-settings label > span { align-self: end; }
 
 .audio-settings select {
   width: 100%;
@@ -112,9 +114,7 @@
 }
 
 .audio-settings .microphone-hint {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .audio-actions {

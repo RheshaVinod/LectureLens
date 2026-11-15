@@ -446,7 +446,6 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   };
   const savedSidebar=localStorage.getItem('lecturelens-sidebar-collapsed');
   if(savedSidebar==='true'||(savedSidebar===null&&matchMedia('(max-width: 950px)').matches))$('sidebarToggle').click();
-  $('newChat').onclick=async()=>{try{await createChat()}catch(e){status(e.message,true)}};
   $('cancelDeleteChat').onclick=()=>$('deleteChatDialog').close();
   $('confirmDeleteChat').onclick=deleteChat;
   $('deleteChatDialog').onclose=()=>{state.deletingChatId=null};

@@ -410,11 +410,11 @@ class ClassInput(BaseModel):
 def create_class(session_id: str, body: ClassInput):
     name = body.name.strip()
     if len(name) < 2:
-        raise HTTPException(422, "Class name is too short")
+        raise HTTPException(422, "Course name is too short")
     with conn() as db:
         session(db, session_id)
         if db.execute("SELECT 1 FROM classes WHERE session_id=? AND lower(name)=lower(?)", (session_id, name)).fetchone():
-            raise HTTPException(409, "That class already exists")
+            raise HTTPException(409, "That course already exists")
         class_id = new_id("class")
         db.execute("INSERT INTO classes VALUES (?,?,?,?)", (class_id, session_id, name, int(time.time() * 1000)))
     return {"class_id": class_id, "name": name}

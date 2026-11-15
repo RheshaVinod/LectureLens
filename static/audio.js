@@ -256,7 +256,7 @@
     if (!navigator.mediaDevices?.enumerateDevices) return;
     const selected = ui.microphone.value;
     const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === "audioinput");
-    ui.microphone.replaceChildren(new Option("System default", ""));
+    ui.microphone.replaceChildren(new Option("Default", ""));
     devices.forEach((device, index) => ui.microphone.add(new Option(device.label || `Microphone ${index + 1}`, device.deviceId)));
     if ([...ui.microphone.options].some(option => option.value === selected)) ui.microphone.value = selected;
   }
