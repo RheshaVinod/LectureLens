@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -35,6 +36,9 @@ DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 DB = DATA / "lecturelens.sqlite3"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-3.8-flash-tts")
+TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Sulafat")
 logger = logging.getLogger("lecturelens")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_SLIDE_UPLOAD = 30 * 1024 * 1024
@@ -80,6 +84,7 @@ RECAP_RESPONSE_SCHEMA = {
 MAX_DECK_UPLOAD = 20 * 1024 * 1024
 MAX_DECK_SLIDES = 100
 MAX_QUESTION_FRAMES = 4
+MATERIAL_EXTENSIONS = {".ppt", ".pptx", ".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".txt", ".md"}
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
 app = FastAPI(title="LectureLens")
@@ -121,9 +126,9 @@ with conn() as db:
       name TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS decks (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       class_id TEXT NOT NULL, filename TEXT NOT NULL, slide_count INTEGER NOT NULL,
-      created_at_ms INTEGER NOT NULL);
+      created_at_ms INTEGER NOT NULL, source_path TEXT);
     CREATE TABLE IF NOT EXISTS deck_slides (deck_id TEXT NOT NULL, slide_number INTEGER NOT NULL,
-      title TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(deck_id, slide_number));
+      title TEXT NOT NULL, text TEXT NOT NULL, image_path TEXT, PRIMARY KEY(deck_id, slide_number));
     """)
     columns = {row["name"] for row in db.execute("PRAGMA table_info(segments)").fetchall()}
     if "translated_text" not in columns:
@@ -167,6 +172,10 @@ with conn() as db:
         db.execute("ALTER TABLE messages ADD COLUMN chat_id TEXT")
     if "snapshot_ids_json" not in {column[1] for column in db.execute("PRAGMA table_info(messages)")}:
         db.execute("ALTER TABLE messages ADD COLUMN snapshot_ids_json TEXT")
+    if "image_path" not in {column[1] for column in db.execute("PRAGMA table_info(deck_slides)")}:
+        db.execute("ALTER TABLE deck_slides ADD COLUMN image_path TEXT")
+    if "source_path" not in {column[1] for column in db.execute("PRAGMA table_info(decks)")}:
+        db.execute("ALTER TABLE decks ADD COLUMN source_path TEXT")
     # Older sessions had a single message stream. Keep it as one saved chat.
     legacy_sessions = db.execute("SELECT DISTINCT session_id FROM messages WHERE chat_id IS NULL").fetchall()
     for row in legacy_sessions:
@@ -238,8 +247,13 @@ def save_snapshot(db, session_id, picture, source, captured_at_ms=None, deck_id=
 
 
 def deck_public(row):
+    suffix = Path(row["filename"]).suffix.lower()
+    kind = ("slides" if suffix in (".ppt", ".pptx") else "pdf" if suffix == ".pdf"
+            else "image" if suffix in (".png", ".jpg", ".jpeg", ".webp")
+            else "document" if suffix in (".doc", ".docx") else "text")
     return {"deck_id": row["id"], "class_id": row["class_id"],
             "filename": row["filename"], "slide_count": row["slide_count"],
+            "kind": kind,
             "created_at_ms": row["created_at_ms"]}
 
 
@@ -298,12 +312,117 @@ def extract_deck_slides(raw):
                     if line:
                         lines.append(line)
                 text = "\n".join(lines)[:6000]
-                slides.append({"slide_number": number, "title": lines[0][:120] if lines else f"Slide {number}", "text": text})
-            if not any(slide["text"] for slide in slides):
-                raise HTTPException(422, "No selectable text found in the slides. This version needs a deck with slide text.")
+                item = {"slide_number": number, "title": lines[0][:120] if lines else f"Slide {number}", "text": text}
+                rels_name = f"ppt/slides/_rels/{posixpath.basename(name)}.rels"
+                if rels_name in files:
+                    slide_rels = ElementTree.fromstring(archive.read(rels_name))
+                    media_targets = {rel.get("Id"): rel.get("Target", "")
+                                     for rel in slide_rels.findall(f"{package}Relationship")}
+                    for blip in slide.iter(f"{drawing}blip"):
+                        target = media_targets.get(blip.get(f"{relationship}embed"), "")
+                        media_name = posixpath.normpath(posixpath.join("ppt/slides", target))
+                        if not media_name.startswith("ppt/media/") or media_name not in files or files[media_name].file_size > 8 * 1024 * 1024:
+                            continue
+                        try:
+                            image = Image.open(io.BytesIO(archive.read(media_name))).convert("RGB")
+                            image.thumbnail((1600, 1600))
+                            output = io.BytesIO()
+                            image.save(output, "JPEG", quality=85)
+                            item["image_bytes"] = output.getvalue()
+                            break
+                        except (UnidentifiedImageError, ValueError, OSError, Image.DecompressionBombError):
+                            continue
+                slides.append(item)
+            if not any(slide["text"] or slide.get("image_bytes") for slide in slides):
+                raise HTTPException(422, "No readable text or images found in the slides")
             return slides
     except (zipfile.BadZipFile, ElementTree.ParseError, KeyError, RuntimeError):
         raise HTTPException(422, "This is not a readable PowerPoint deck")
+
+
+def text_sections(text, title):
+    clean = text.strip()
+    if not clean:
+        raise HTTPException(422, "No readable text found in this file")
+    chunks = [clean[index:index + 1200] for index in range(0, min(len(clean), 36000), 1200)]
+    return [{"slide_number": index, "title": f"{title} · section {index}", "text": chunk}
+            for index, chunk in enumerate(chunks, 1)]
+
+
+def word_bytes(raw, filename):
+    if filename.lower().endswith(".docx"):
+        return raw
+    converter = shutil.which("soffice") or shutil.which("libreoffice")
+    if not converter:
+        raise HTTPException(422, "Legacy .doc files need LibreOffice. Save as .docx and upload again.")
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "lecture.doc"
+        source.write_bytes(raw)
+        try:
+            result = subprocess.run([converter, "--headless", "--convert-to", "docx", "--outdir", directory, str(source)],
+                                    capture_output=True, timeout=45, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise HTTPException(422, "Could not convert this .doc. Save as .docx and upload again.")
+        converted = Path(directory) / "lecture.docx"
+        if result.returncode != 0 or not converted.exists():
+            raise HTTPException(422, "Could not convert this .doc. Save as .docx and upload again.")
+        return converted.read_bytes()
+
+
+def extract_material(raw, filename):
+    suffix = Path(filename).suffix.lower()
+    if suffix in (".ppt", ".pptx"):
+        return extract_deck_slides(pptx_bytes(raw, filename))
+    if suffix in (".doc", ".docx"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(word_bytes(raw, filename))) as archive:
+                if sum(info.file_size for info in archive.infolist()) > 80 * 1024 * 1024:
+                    raise HTTPException(413, "Word document is too large after extraction")
+                document = archive.read("word/document.xml")
+            root = ElementTree.fromstring(document)
+            namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+            lines = ["".join(node.text or "" for node in paragraph.iter(f"{namespace}t"))
+                     for paragraph in root.iter(f"{namespace}p")]
+            return text_sections("\n".join(line for line in lines if line.strip()), filename)
+        except (zipfile.BadZipFile, KeyError, ElementTree.ParseError):
+            raise HTTPException(422, "This is not a readable Word document")
+    if suffix in (".txt", ".md"):
+        try:
+            return text_sections(raw.decode("utf-8-sig"), filename)
+        except UnicodeDecodeError:
+            raise HTTPException(422, "Text file must use UTF-8 encoding")
+    if suffix == ".pdf":
+        try:
+            with fitz.open(stream=raw, filetype="pdf") as document:
+                if not 1 <= document.page_count <= MAX_DECK_SLIDES:
+                    raise HTTPException(422, "PDF must have 1 to 100 pages")
+                slides = []
+                for index, page in enumerate(document, 1):
+                    text = page.get_text().strip()[:6000]
+                    item = {"slide_number": index, "title": f"Page {index}", "text": text}
+                    if index <= 4:
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+                        image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+                        image.thumbnail((1600, 1600))
+                        output = io.BytesIO()
+                        image.save(output, "JPEG", quality=82)
+                        item["image_bytes"] = output.getvalue()
+                    slides.append(item)
+                return slides
+        except HTTPException:
+            raise
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(422, "This is not a readable PDF") from exc
+    if suffix in (".png", ".jpg", ".jpeg", ".webp"):
+        try:
+            image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+            image.thumbnail((1600, 1600))
+            output = io.BytesIO()
+            image.save(output, "JPEG", quality=85)
+            return [{"slide_number": 1, "title": filename, "text": "", "image_bytes": output.getvalue()}]
+        except (UnidentifiedImageError, ValueError, OSError, Image.DecompressionBombError) as exc:
+            raise HTTPException(422, "This is not a readable image") from exc
+    raise HTTPException(422, "Supported files: PPT, PPTX, PDF, DOC, DOCX, PNG, JPG, WEBP, TXT, MD")
 
 
 @app.get("/")
@@ -381,25 +500,76 @@ def get_session(session_id: str):
 @app.post("/api/sessions/{session_id}/decks")
 async def upload_deck(session_id: str, file: UploadFile = File(...), class_id: str = Form(...)):
     filename = Path(file.filename or "").name[:120]
-    if not filename.lower().endswith((".ppt", ".pptx")):
-        raise HTTPException(422, "Choose a .ppt or .pptx PowerPoint file")
+    if Path(filename).suffix.lower() not in MATERIAL_EXTENSIONS:
+        raise HTTPException(422, "Supported files: PPT, PPTX, PDF, DOC, DOCX, PNG, JPG, WEBP, TXT, MD")
     with conn() as db:
         session(db, session_id)
         if not db.execute("SELECT 1 FROM classes WHERE id=? AND session_id=?", (class_id, session_id)).fetchone():
             raise HTTPException(404, "Class not found in this session")
     raw = await file.read(MAX_DECK_UPLOAD + 1)
     if len(raw) > MAX_DECK_UPLOAD:
-        raise HTTPException(413, "PowerPoint file exceeds 20 MB")
-    converted = await asyncio.to_thread(pptx_bytes, raw, filename)
-    slides = await asyncio.to_thread(extract_deck_slides, converted)
+        raise HTTPException(413, "File exceeds 20 MB")
+    slides = await asyncio.to_thread(extract_material, raw, filename)
+    deck_id = new_id("deck")
+    saved_paths = []
+    source_path = None
+    if Path(filename).suffix.lower() == ".pdf":
+        source_path = DATA / f"{deck_id}.pdf"
+        source_path.write_bytes(raw)
+        saved_paths.append(source_path)
+    for slide in slides:
+        if slide.get("image_bytes"):
+            path = DATA / f"{deck_id}_{slide['slide_number']}.jpg"
+            path.write_bytes(slide.pop("image_bytes"))
+            slide["image_path"] = str(path)
+            saved_paths.append(path)
     with conn() as db:
-        deck_id = new_id("deck")
-        db.execute("INSERT INTO decks VALUES (?,?,?,?,?,?)",
-                   (deck_id, session_id, class_id, filename, len(slides), int(time.time() * 1000)))
-        db.executemany("INSERT INTO deck_slides VALUES (?,?,?,?)",
-                       [(deck_id, slide["slide_number"], slide["title"], slide["text"]) for slide in slides])
-        deck = db.execute("SELECT * FROM decks WHERE id=?", (deck_id,)).fetchone()
+        try:
+            db.execute("INSERT INTO decks (id,session_id,class_id,filename,slide_count,created_at_ms,source_path) VALUES (?,?,?,?,?,?,?)",
+                       (deck_id, session_id, class_id, filename, len(slides), int(time.time() * 1000),
+                        str(source_path) if source_path else None))
+            db.executemany("INSERT INTO deck_slides (deck_id,slide_number,title,text,image_path) VALUES (?,?,?,?,?)",
+                           [(deck_id, slide["slide_number"], slide["title"], slide["text"], slide.get("image_path")) for slide in slides])
+            deck = db.execute("SELECT * FROM decks WHERE id=?", (deck_id,)).fetchone()
+        except Exception:
+            for path in saved_paths:
+                path.unlink(missing_ok=True)
+            raise
     return deck_public(deck)
+
+
+def material_image_path(deck, slide):
+    if slide["image_path"] and Path(slide["image_path"]).exists():
+        return Path(slide["image_path"])
+    if Path(deck["filename"]).suffix.lower() != ".pdf" or not deck["source_path"]:
+        return None
+    source = Path(deck["source_path"])
+    if not source.exists():
+        return None
+    with fitz.open(source) as document:
+        page = document[slide["slide_number"] - 1]
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+        image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+        image.thumbnail((1600, 1600))
+        path = DATA / f"{deck['id']}_{slide['slide_number']}.jpg"
+        image.save(path, "JPEG", quality=82)
+    with conn() as db:
+        db.execute("UPDATE deck_slides SET image_path=? WHERE deck_id=? AND slide_number=?",
+                   (str(path), deck["id"], slide["slide_number"]))
+    return path
+
+
+@app.get("/api/sessions/{session_id}/materials/{deck_id}/pages/{page_number}/image")
+def material_page_image(session_id: str, deck_id: str, page_number: int):
+    with conn() as db:
+        deck = db.execute("SELECT * FROM decks WHERE id=? AND session_id=?", (deck_id, session_id)).fetchone()
+        slide = db.execute("SELECT * FROM deck_slides WHERE deck_id=? AND slide_number=?", (deck_id, page_number)).fetchone() if deck else None
+    if not deck or not slide:
+        raise HTTPException(404, "Uploaded page not found")
+    path = material_image_path(deck, slide)
+    if not path:
+        raise HTTPException(404, "This page has no visual preview")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 class ClassInput(BaseModel):
@@ -639,6 +809,92 @@ def message_public(row):
             "created_at_ms": row["created_at_ms"]}
 
 
+def spoken_math(text):
+    text = re.sub(r"\\{2,}", lambda _: "\\", text)
+    text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"\1 over \2", text)
+    text = re.sub(r"\\sqrt\{([^{}]+)\}", r"square root of \1", text)
+    text = re.sub(r"\\text\{([^{}]+)\}", r"\1", text)
+    for command, words in ((r"\\(?:leq|le)\b", " less than or equal to "),
+                           (r"\\(?:geq|ge)\b", " greater than or equal to "),
+                           (r"\\(?:times|cdot)\b", " times "),
+                           (r"\\(?:rightarrow|to)\b", " approaches ")):
+        text = re.sub(command, words, text)
+    text = re.sub(r"\\([a-zA-Z]+)\b", r"\1", text)
+    text = re.sub(r"\bO\s*\(([^)]+)\)", r"big O of \1", text)
+    return re.sub(r"\s+", " ", text.replace("{", "").replace("}", "")).strip()
+
+
+def answer_for_speech(answer):
+    text = re.sub(r"(?im)^\s*Sources:\s*(?:\[\[[FAM]\d+\]\]\s*)+$", "", answer)
+    text = re.sub(r"\[\[(?:[FAM]\d+|R1)\]\]", "", text)
+    text = re.sub(r"!?\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\$\$([\s\S]*?)\$\$|\$([^$\n]+)\$|\\\((.*?)\\\)",
+                  lambda match: spoken_math(next(part for part in match.groups() if part is not None)), text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*|^\s*[-*+]\s+|^\s*\d+\.\s+", "", text)
+    text = re.sub(r"\*\*|__|`", "", text)
+    text = re.sub(r"(?m)^\s*>\s*", "", text)
+    text = re.sub(r"\n+", ". ", text)
+    text = re.sub(r"(?:\.\s*){2,}", ". ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+([,.!?;:])", r"\1", text)
+
+
+@app.post("/api/sessions/{session_id}/messages/{message_id}/speech")
+async def answer_speech(session_id: str, message_id: str):
+    with conn() as db:
+        session(db, session_id)
+        row = db.execute("SELECT answer_json FROM messages WHERE id=? AND session_id=?",
+                         (message_id, session_id)).fetchone()
+    if not row:
+        raise HTTPException(404, "Answer not found in this lecture")
+    text = answer_for_speech(json.loads(row["answer_json"]).get("answer", ""))
+    if not text:
+        raise HTTPException(422, "This answer has no readable text")
+    if len(text) > 12000:
+        raise HTTPException(413, "This answer is too long for read aloud")
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable read aloud")
+    payload = {"model": TTS_MODEL,
+               "input": [{"type": "user_input", "content": [{"type": "text", "text": text,
+                         "annotations": [{"type": "speech_metadata", "style": "warm, clear, conversational tutor"}]}]}],
+               "response_format": {"type": "audio"},
+               "generation_config": {"speech_config": [{"voice": TTS_VOICE}]}}
+    models = [TTS_MODEL]
+    if TTS_FALLBACK_MODEL and TTS_FALLBACK_MODEL != TTS_MODEL:
+        models.append(TTS_FALLBACK_MODEL)
+    audio = None
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            for model in models:
+                payload["model"] = model
+                try:
+                    response = await client.post("https://generativelanguage.googleapis.com/v1beta/interactions",
+                                                 headers={"x-goog-api-key": key}, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    blocks = [content for step in data.get("steps", []) if step.get("type") == "model_output"
+                              for content in step.get("content", []) if content.get("type") == "audio"]
+                    audio = base64.b64decode(blocks[-1]["data"], validate=True)
+                    if len(audio) > 25 * 1024 * 1024 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+                        raise ValueError("Invalid WAV audio")
+                    break
+                except httpx.HTTPStatusError as exc:
+                    logger.warning("TTS model=%s HTTP status=%s", model, exc.response.status_code)
+                    if exc.response.status_code not in (429, 500, 502, 503, 504) or model == models[-1]:
+                        raise HTTPException(502, model_error_detail(exc.response.status_code)) from exc
+                except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+                    logger.warning("TTS model=%s response error=%s", model, type(exc).__name__)
+                    if model == models[-1]:
+                        raise HTTPException(502, "The voice service returned no playable audio. Try again.") from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Voice generation took too long. Try again.") from exc
+    except httpx.RequestError as exc:
+        logger.warning("TTS network error: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not connect to the voice service. Try again.") from exc
+    return Response(audio, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})
+
+
 def image_part(data):
     return {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(data).decode()}}
 
@@ -664,22 +920,59 @@ def nearby_segments(db, session_id, anchor_ms, limit=12):
     return sorted(rows, key=lambda row: row["start_ms"])
 
 
-def deck_context(decks, slides_by_deck):
+def rank_material_pages(decks, slides_by_deck, question, limit=10):
+    stop = {"what", "which", "when", "where", "why", "how", "does", "this", "that", "these", "those",
+            "the", "and", "for", "with", "from", "about", "can", "you", "please", "explain", "lecture"}
+    terms = set(re.findall(r"\w+", question.lower())) - stop
+    terms = {term for term in terms if len(term) > 2}
+    ranked = []
+    for deck_index, deck in enumerate(decks):
+        filename_words = set(re.findall(r"\w+", deck["filename"].lower()))
+        for slide in slides_by_deck[deck["id"]]:
+            title_words = set(re.findall(r"\w+", slide["title"].lower()))
+            body_words = set(re.findall(r"\w+", slide["text"].lower()))
+            score = 3 * len(terms & (filename_words | title_words)) + len(terms & body_words)
+            ranked.append((score, deck_index, slide["slide_number"], deck, slide))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    chosen = []
+    seen_decks = set()
+    for item in ranked:
+        if item[3]["id"] not in seen_decks and len(chosen) < limit:
+            chosen.append(item)
+            seen_decks.add(item[3]["id"])
+    selected_ids = {(item[3]["id"], item[2]) for item in chosen}
+    for item in ranked:
+        if len(chosen) >= limit:
+            break
+        if (item[3]["id"], item[2]) not in selected_ids:
+            chosen.append(item)
+            selected_ids.add((item[3]["id"], item[2]))
+    chosen.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [(item[3], item[4]) for item in chosen]
+
+
+def deck_context(decks, slides_by_deck, visual_ids=None, labels=None):
     if not decks:
         return None, {}
+    visual_ids = visual_ids or set()
+    labels = labels or {}
     count = sum(len(slides_by_deck[deck["id"]]) for deck in decks)
     per_slide = max(60, min(1200, 16000 // max(1, count) - 90))
     references = {}
     entries = []
     for deck in decks:
+        kind = deck_public(deck)["kind"]
+        unit = "slide" if kind == "slides" else "page" if kind == "pdf" else "section" if kind in ("document", "text") else "image"
         slides = []
         for slide in slides_by_deck[deck["id"]]:
             slide_id = f"{deck['id']}:{slide['slide_number']}"
-            references[slide_id] = f"{deck['filename']} · slide {slide['slide_number']}"
-            slides.append({"slide_id": slide_id, "slide_number": slide["slide_number"],
-                           "title": slide["title"], "extracted_text": slide["text"][:per_slide]})
-        entries.append({"filename": deck["filename"], "slides": slides})
-    return {"decks": entries, "limitation": "Only selectable slide text was extracted; embedded images, charts, and handwritten content are not included."}, references
+            references[slide_id] = f"{deck['filename']} · {unit} {slide['slide_number']}"
+            slides.append({"source_label": labels.get(slide_id), "slide_id": slide_id, "slide_number": slide["slide_number"],
+                           "title": slide["title"], "extracted_text": slide["text"][:per_slide],
+                           "visual_supplied": slide_id in visual_ids,
+                           "visual_note": "Embedded raster image only; slide shapes and charts are not rendered" if kind == "slides" and slide_id in visual_ids else None})
+        entries.append({"filename": deck["filename"], "kind": kind, "slides": slides})
+    return {"decks": entries, "limitation": "Only the most relevant uploaded pages are included. Visuals are available only when visual_supplied is true. PPT visual context is an embedded raster image, not a rendered slide; slide shapes/charts and Word embedded images are not extracted."}, references
 
 
 ANSWER_SCHEMA = {
@@ -691,9 +984,10 @@ ANSWER_SCHEMA = {
         "uncertainties": {"type": "array", "items": {"type": "string"}},
         "transcript_segment_ids": {"type": "array", "items": {"type": "string"}},
         "slide_references": {"type": "array", "items": {"type": "string"}},
+        "citations": {"type": "array", "items": {"type": "string"}},
         "status": {"type": "string", "enum": ["supported", "partial", "unsupported"]},
     },
-    "required": ["answer", "visible_evidence", "inferred_explanation", "uncertainties", "transcript_segment_ids", "slide_references", "status"],
+    "required": ["answer", "visible_evidence", "inferred_explanation", "uncertainties", "transcript_segment_ids", "slide_references", "citations", "status"],
     "additionalProperties": False,
 }
 
@@ -762,10 +1056,10 @@ async def ask(session_id: str, body: Question):
         if selected_ids is None:
             selected_ids = [available_decks[0]["id"]] if available_decks else []
         if len(selected_ids) > 10 or len(selected_ids) != len(set(selected_ids)):
-            raise HTTPException(422, "Select up to 10 distinct PowerPoint decks")
+            raise HTTPException(422, "Select up to 10 distinct files")
         available_by_id = {row["id"]: row for row in available_decks}
         if any(deck_id not in available_by_id for deck_id in selected_ids):
-            raise HTTPException(422, "A selected PowerPoint deck does not belong to this class")
+            raise HTTPException(422, "A selected file does not belong to this course")
         decks = [available_by_id[deck_id] for deck_id in selected_ids]
         slides_by_deck = {deck["id"]: db.execute("SELECT * FROM deck_slides WHERE deck_id=? ORDER BY slide_number",
                                                  (deck["id"],)).fetchall() for deck in decks}
@@ -805,14 +1099,48 @@ async def ask(session_id: str, body: Question):
             if not segments and latest_segment:
                 anchor_ms = latest_segment["end_ms"]
                 segments = nearby_segments(db, session_id, anchor_ms)
-    if not shot and not segments:
-        raise HTTPException(409, "No transcript or visual context is available yet")
+    if not shot and not segments and not decks:
+        raise HTTPException(409, "No transcript, visual, or uploaded file context is available yet")
     if body.region and not shot:
         raise HTTPException(422, "A selected region requires a snapshot")
     if body.region and (body.region.x + body.region.width > 1.000001 or body.region.y + body.region.height > 1.000001):
         raise HTTPException(422, "Region extends outside image")
     image_bytes = Path(shot["path"]).read_bytes() if shot else None
-    slides_context, valid_slide_ids = deck_context(decks, slides_by_deck)
+    selected_materials = rank_material_pages(decks, slides_by_deck, body.question)
+    selected_pages = {deck["id"]: [] for deck in decks}
+    material_labels = {}
+    for index, (deck, slide) in enumerate(selected_materials, 1):
+        selected_pages[deck["id"]].append(slide)
+        material_labels[f"{deck['id']}:{slide['slide_number']}"] = f"M{index}"
+    image_slots = min(4, max(0, 6 - len(selected_shots) - len(recent_shots) - (1 if body.region else 0)))
+    material_images = []
+    for deck, slide in selected_materials:
+        if len(material_images) >= image_slots:
+            break
+        path = material_image_path(deck, slide)
+        if path:
+            material_images.append((deck, slide, path))
+    visual_ids = {f"{deck['id']}:{slide['slide_number']}" for deck, slide, _ in material_images}
+    slides_context, valid_slide_ids = deck_context(decks, selected_pages, visual_ids, material_labels)
+    source_map = {}
+    frame_rows = [*selected_shots, *reversed(recent_shots)]
+    for index, frame in enumerate(frame_rows, 1):
+        source_map[f"F{index}"] = {"label": f"F{index}", "kind": "frame", "id": frame["id"],
+                                   "title": f"Board frame · {frame['captured_at_ms'] // 60000}:{frame['captured_at_ms'] // 1000 % 60:02d}",
+                                   "captured_at_ms": frame["captured_at_ms"],
+                                   "image_url": f"/api/snapshots/{frame['id']}/image"}
+    for index, segment in enumerate(segments, 1):
+        source_map[f"A{index}"] = {"label": f"A{index}", "kind": "transcript", "id": segment["id"],
+                                   "title": f"Lecture caption · {segment['start_ms'] // 60000}:{segment['start_ms'] // 1000 % 60:02d}",
+                                   "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
+                                   "excerpt": segment["text"]}
+    for deck, slide in selected_materials:
+        slide_id = f"{deck['id']}:{slide['slide_number']}"
+        label = material_labels[slide_id]
+        source_map[label] = {"label": label, "kind": "material", "id": slide_id,
+                             "title": valid_slide_ids[slide_id], "excerpt": slide["text"][:1200],
+                             "image_url": (f"/api/sessions/{session_id}/materials/{deck['id']}/pages/{slide['slide_number']}/image"
+                                           if slide_id in visual_ids else None)}
     recent_conversation = []
     for row in reversed(previous):
         prior_result = json.loads(row["answer_json"])
@@ -823,23 +1151,28 @@ async def ask(session_id: str, body: Question):
             continue
         recent_conversation.append({"question": row["question"], "answer": prior_result.get("answer", "")})
     recent_conversation = recent_conversation[-4:]
-    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. When frames are supplied, use them as visual evidence and label observations by F1, F2, etc.; F1 is primary and region R1 belongs only to F1. When no frame is supplied, answer solely from the transcript and leave visible_evidence empty. Preserve mathematical symbols exactly; if illegible or missing, say so. Distinguish visible evidence from transcript statements, deck text, and inference. Uploaded deck text is background context and contains no embedded images or diagrams. Cite only relevant exact slide IDs. Never treat timestamp proximity as proof of a visual reference. Do not invent details. Use Markdown inside JSON strings and LaTeX delimiters for equations. Return concise structured JSON.\n" +
+    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. Use relevant evidence from the provided board frames (F), lecture captions (A), and uploaded material pages (M). Put citations like [[F1]], [[A2]], and [[M3]] directly after the claims they support in answer, and list those exact labels in citations. Cite only labels present in source_catalog. Do not cite a source merely because its timestamp is nearby; check its content. When no live frame is supplied, visible_evidence must be empty: uploaded material images are background context, not proof of what appeared live. F1 is the primary frame and region R1 belongs only to F1. If a region R1 is selected and an answer claim specifically describes that region, place [[R1]] immediately after that claim; otherwise do not use [[R1]]. R1 is a region link, not a source citation. Preserve mathematical notation; flag unreadable details. Distinguish observed content from explanation and unsupported inference. Only claim to see uploaded material images when visual_supplied is true. Include only relevant exact slide IDs in slide_references and actual used transcript IDs in transcript_segment_ids. Use Markdown inside JSON strings and LaTeX delimiters for equations. Return concise structured JSON.\n" +
              json.dumps({"question": body.question, "language": body.language,
                          "region_label": "R1" if body.region else None,
                          "region_bbox_normalized": body.region.model_dump() if body.region else None,
-                         "context_mode": "visual_and_transcript" if selected_shots else "transcript_only",
+                         "context_mode": "visual_and_transcript" if selected_shots else "transcript_only" if segments else "uploaded_material_only",
                          "context_anchor_ms": anchor_ms,
-                         "selected_frames": [{"label": f"F{index}", "snapshot_id": item["id"], "captured_at_ms": item["captured_at_ms"]}
-                                             for index, item in enumerate(selected_shots, 1)],
-                         "transcript": [dict(s) for s in segments],
+                         "source_catalog": [{key: value for key, value in source.items() if key not in ("image_url", "excerpt")}
+                                            for source in source_map.values()],
+                         "transcript": [{**dict(s), "source_label": f"A{index}"}
+                                        for index, s in enumerate(segments, 1)],
                          "lecture_deck": slides_context,
                          "recent_conversation": recent_conversation}, ensure_ascii=False)}]
     for index, selected_shot in enumerate(selected_shots, 1):
         parts.append({"text": f"Selected frame F{index} at {selected_shot['captured_at_ms']} ms:"})
         parts.append(image_part(image_bytes if index == 1 else Path(selected_shot["path"]).read_bytes()))
-    for older in reversed(recent_shots):
-        parts.append({"text": f"Earlier snapshot at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
+    for index, older in enumerate(reversed(recent_shots), len(selected_shots) + 1):
+        parts.append({"text": f"Earlier frame F{index} at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
         parts.append(image_part(Path(older["path"]).read_bytes()))
+    for deck, slide, path in material_images:
+        slide_id = f"{deck['id']}:{slide['slide_number']}"
+        parts.append({"text": f"Uploaded material {deck['filename']} · {material_labels[slide_id]}. This is background context, not a live camera frame:"})
+        parts.append(image_part(path.read_bytes()))
     if body.region and image_bytes:
         im = Image.open(io.BytesIO(image_bytes))
         r = body.region
@@ -871,13 +1204,35 @@ async def ask(session_id: str, body: Question):
                         if segment_id in {row["id"] for row in segments}]
     source_timestamps = [{"segment_id": row["id"], "start_ms": row["start_ms"], "end_ms": row["end_ms"]}
                          for row in segments if row["id"] in used_segment_ids]
-    result = {"answer": result["answer"], "visible_evidence": result.get("visible_evidence", []) if shot else [],
+    answer_text = re.sub(r"\[\[([FAM]\d+)\]\]", lambda match: match.group(0) if match.group(1) in source_map else "", result["answer"])
+    if not body.region:
+        answer_text = answer_text.replace("[[R1]]", "")
+    citations = []
+    for label in re.findall(r"\[\[([FAM]\d+)\]\]", answer_text) + (result.get("citations") or []):
+        if isinstance(label, str) and label in source_map and label not in citations:
+            citations.append(label)
+    if body.region and "[[R1]]" in answer_text and "F1" in source_map and "F1" not in citations:
+        citations.insert(0, "F1")
+    if not citations and result.get("status") != "unsupported":
+        used_slide_ids = set(result.get("slide_references") or [])
+        citations.extend(source["label"] for source in source_map.values()
+                         if source["kind"] == "material" and source["id"] in used_slide_ids)
+        citations.extend(source["label"] for source in source_map.values()
+                         if source["kind"] == "transcript" and source["id"] in used_segment_ids)
+        if shot and result.get("visible_evidence"):
+            citations.insert(0, "F1")
+    if citations and not re.search(r"\[\[[FAM]\d+\]\]", answer_text):
+        answer_text += "\n\nSources: " + " ".join(f"[[{label}]]" for label in citations)
+    result = {"answer": answer_text, "answer_language": body.language,
+              "visible_evidence": result.get("visible_evidence", []) if shot else [],
               "inferred_explanation": result.get("inferred_explanation", []),
               "uncertainties": result.get("uncertainties", []),
               "transcript_segment_ids": used_segment_ids,
               "source_timestamps": source_timestamps,
               "slide_references": [valid_slide_ids[slide_id] for slide_id in (result.get("slide_references") or [])
                                    if isinstance(slide_id, str) and slide_id in valid_slide_ids],
+              "citations": citations,
+              "sources": [source_map[label] for label in citations],
               "used_lecture_deck": bool(decks),
               "used_lecture_deck_ids": selected_ids,
               "snapshot_at_ms": shot["captured_at_ms"] if shot else None,

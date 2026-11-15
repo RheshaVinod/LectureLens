@@ -1,6 +1,6 @@
 # LectureLens multimodal lecture companion
 
-LectureLens captures microphone audio and board images on one shared session clock. It creates live captions with optional translation, stores final transcript segments in SQLite, captures a laptop-camera snapshot every four seconds and whenever a caption finalizes, and accepts phone photos plus PDF/image slide uploads. The final interface organizes chats by class, supports selectable-text PowerPoint context, lets students compare up to four frames, zoom into a snapshot, select a region, and ask follow-up questions in ten languages. Gemini receives the chosen visuals, nearby timestamped transcript, selected deck text, and recent conversation; answers retain their evidence timestamps.
+LectureLens captures microphone audio and board images on one shared session clock. It creates live captions with optional translation, stores final transcript segments in SQLite, captures a laptop-camera snapshot every four seconds and whenever a caption finalizes, and accepts phone photos plus PDF/image slide uploads. The interface organizes chats by course, accepts PPT, PDF, Word, image, and text files as optional context, lets students compare up to four frames, zoom into a snapshot, select a region, and ask follow-up questions in ten languages. Gemini receives chosen visuals, nearby timestamped transcript, selected file content, and recent conversation; answers retain their evidence timestamps.
 
 ## Run
 
@@ -8,6 +8,12 @@ LectureLens captures microphone audio and board images on one shared session clo
 2. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey). For local development, create a `.env` file next to `app.py` containing `GEMINI_API_KEY=your_key_here`. The app loads it at startup. In Replit, add `GEMINI_API_KEY` as a server-side secret instead. Do not put it in frontend code or commit it.
 3. Run `uvicorn app:app --host 0.0.0.0 --port 8000` and open the HTTPS Replit URL (or `http://localhost:8000`).
 4. Allow microphone access and start captions. For visuals, use the laptop camera, upload slides, or choose **Connect phone** and scan the QR code to take board photos with the phone's rear camera.
+
+To ask by voice in Chrome, tap the microphone in the question box, speak, then tap it again to finish. Review or edit the recognized text and press **Ask**. The current frame is pinned when dictation starts. If live captions are running, they pause during the question and resume afterward so the student's words are not stored as lecturer transcript. Voice dictation uses Chrome speech recognition and needs microphone permission on localhost or HTTPS.
+
+Each answer has a **Listen** button for optional natural read-aloud output. Tap **Cancel** while audio is being prepared or **Stop** during playback. The server sends the saved answer text (without citation labels or math markup) to Gemini TTS using the same server-side `GEMINI_API_KEY`, then returns WAV audio to the browser. Live captions pause during playback and resume afterward. The default voice model is `gemini-3.8-flash-lite-tts`, with `gemini-3.8-flash-tts` as a fallback for temporary failures. Set `GEMINI_TTS_MODEL`, `GEMINI_TTS_FALLBACK_MODEL`, or `GEMINI_TTS_VOICE` to override those defaults and the `Sulafat` voice. Playback audio is cached only in the current browser tab.
+
+Use **Add files** for optional answer context: `.ppt`, `.pptx`, `.pdf`, `.doc`, `.docx`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.txt`, and `.md` (20 MB per file). Select files under **File context** and use **Use files** to include or exclude them from a question. The app ranks pages against each question, sends up to ten relevant pages of extracted text and up to four relevant visuals, and links cited pages, board frames, and caption excerpts directly below the answer. PDF pages beyond the first four can be previewed on demand. PPT slides contribute text and their first embedded raster image when present; PowerPoint shapes/charts are not rendered, and Word embedded images are not extracted. Legacy `.ppt` and `.doc` need LibreOffice on the server. **Add slides** separately adds PDF or image pages to the selectable snapshot timeline.
 
 The model ID defaults to `gemini-3.6-flash`; override with server-side `GEMINI_MODEL` if needed. Each browser session has its own URL and SQLite records. This prototype has no user authentication; do not share session links publicly. The camera runs only while this page is open and capture is on. Replit's local `data/` storage may not survive redeployment.
 
@@ -33,6 +39,8 @@ All times are integer milliseconds since session creation. The audio pipeline au
 - `GET /api/recaps/{recap_id}/markdown` — download a recap as a Markdown study guide.
 
 For camera captures, questions retrieve transcript around the snapshot timestamp. For uploaded slides, the question time becomes the transcript anchor. If no snapshot exists, questions still work from nearby audio transcript segments alone and the response is explicitly marked as transcript-only evidence. Nearby timestamps are candidate context, not proof that spoken words refer to a particular visual region.
+
+Answers may include clickable `F` (board frame), `A` (audio caption), and `M` (uploaded material) citations. The server validates model-returned labels against the sources actually supplied to that question. An audio citation opens the transcript excerpt and timestamp; raw audio is not stored or played back.
 
 Study recaps combine the session transcript and translations, visual timeline, up to six representative snapshots/slides, and prior student Q&A. The structured result contains key concepts with lecture timestamps, important visuals, formulas and terms, review questions with answers, unresolved questions, and suggested next steps.
 
