@@ -1,15 +1,23 @@
 """Single-process LectureLens hackathon prototype."""
+import asyncio
 import base64
 import io
 import json
+import logging
 import os
+import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 import uuid
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
+from xml.etree import ElementTree
 
 import httpx
 import pymupdf as fitz
@@ -27,6 +35,7 @@ DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 DB = DATA / "lecturelens.sqlite3"
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+logger = logging.getLogger("lecturelens")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_SLIDE_UPLOAD = 30 * 1024 * 1024
 PHONE_JOIN_LIFETIME_MS = 6 * 60 * 60 * 1000
@@ -68,6 +77,9 @@ RECAP_RESPONSE_SCHEMA = {
     "required": ["title", "overview", "key_concepts", "important_visuals",
                  "formulas_and_terms", "review_questions", "unresolved_questions", "next_steps"],
 }
+MAX_DECK_UPLOAD = 20 * 1024 * 1024
+MAX_DECK_SLIDES = 100
+MAX_QUESTION_FRAMES = 4
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
 app = FastAPI(title="LectureLens")
@@ -98,10 +110,20 @@ with conn() as db:
       language TEXT NOT NULL, text TEXT NOT NULL, translated_text TEXT,
       translated_language TEXT);
     CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-      snapshot_id TEXT NOT NULL, region_json TEXT, question TEXT NOT NULL,
-      answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+      snapshot_id TEXT, region_json TEXT, question TEXT NOT NULL,
+      answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+      chat_id TEXT, snapshot_ids_json TEXT);
     CREATE TABLE IF NOT EXISTS recaps (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
       language TEXT NOT NULL, recap_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+      title TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS classes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+      name TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS decks (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+      class_id TEXT NOT NULL, filename TEXT NOT NULL, slide_count INTEGER NOT NULL,
+      created_at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS deck_slides (deck_id TEXT NOT NULL, slide_number INTEGER NOT NULL,
+      title TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(deck_id, slide_number));
     """)
     columns = {row["name"] for row in db.execute("PRAGMA table_info(segments)").fetchall()}
     if "translated_text" not in columns:
@@ -121,10 +143,17 @@ with conn() as db:
         ALTER TABLE messages RENAME TO messages_with_required_snapshot;
         CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
           snapshot_id TEXT, region_json TEXT, question TEXT NOT NULL,
-          answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
-        INSERT INTO messages SELECT * FROM messages_with_required_snapshot;
-        DROP TABLE messages_with_required_snapshot;
+          answer_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+          chat_id TEXT, snapshot_ids_json TEXT);
         """)
+        chat_expression = "chat_id" if "chat_id" in message_columns else "NULL"
+        snapshot_ids_expression = "snapshot_ids_json" if "snapshot_ids_json" in message_columns else "NULL"
+        db.execute(f"""INSERT INTO messages
+                    (id,session_id,snapshot_id,region_json,question,answer_json,created_at_ms,chat_id,snapshot_ids_json)
+                    SELECT id,session_id,snapshot_id,region_json,question,answer_json,created_at_ms,
+                           {chat_expression},{snapshot_ids_expression}
+                    FROM messages_with_required_snapshot""")
+        db.execute("DROP TABLE messages_with_required_snapshot")
     session_columns = {row["name"] for row in db.execute("PRAGMA table_info(sessions)").fetchall()}
     if "join_token" not in session_columns:
         db.execute("ALTER TABLE sessions ADD COLUMN join_token TEXT")
@@ -134,6 +163,28 @@ with conn() as db:
     for row in db.execute("SELECT id FROM sessions WHERE join_token IS NULL").fetchall():
         db.execute("UPDATE sessions SET join_token=?, join_expires_epoch_ms=? WHERE id=?",
                    (secrets.token_urlsafe(18), now_ms + PHONE_JOIN_LIFETIME_MS, row["id"]))
+    if "chat_id" not in {column[1] for column in db.execute("PRAGMA table_info(messages)")}:
+        db.execute("ALTER TABLE messages ADD COLUMN chat_id TEXT")
+    if "snapshot_ids_json" not in {column[1] for column in db.execute("PRAGMA table_info(messages)")}:
+        db.execute("ALTER TABLE messages ADD COLUMN snapshot_ids_json TEXT")
+    # Older sessions had a single message stream. Keep it as one saved chat.
+    legacy_sessions = db.execute("SELECT DISTINCT session_id FROM messages WHERE chat_id IS NULL").fetchall()
+    for row in legacy_sessions:
+        sid = row["session_id"]
+        first = db.execute("SELECT question, created_at_ms FROM messages WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (sid,)).fetchone()
+        chat_id = f"chat_{uuid.uuid4().hex}"
+        db.execute("INSERT INTO chats (id,session_id,title,created_at_ms) VALUES (?,?,?,?)", (chat_id, sid, first["question"][:64], first["created_at_ms"]))
+        db.execute("UPDATE messages SET chat_id=? WHERE session_id=? AND chat_id IS NULL", (chat_id, sid))
+    if "class_id" not in {column[1] for column in db.execute("PRAGMA table_info(chats)")}:
+        db.execute("ALTER TABLE chats ADD COLUMN class_id TEXT")
+    for row in db.execute("SELECT id FROM sessions").fetchall():
+        sid = row["id"]
+        for name in ("Analysis of Algorithms", "Deep Learning"):
+            if not db.execute("SELECT 1 FROM classes WHERE session_id=? AND name=?", (sid, name)).fetchone():
+                db.execute("INSERT INTO classes VALUES (?,?,?,?)",
+                           (f"class_{uuid.uuid4().hex}", sid, name, int(time.time() * 1000)))
+        default_class = db.execute("SELECT id FROM classes WHERE session_id=? AND name='Analysis of Algorithms'", (sid,)).fetchone()["id"]
+        db.execute("UPDATE chats SET class_id=? WHERE session_id=? AND class_id IS NULL", (default_class, sid))
 
 
 def new_id(prefix):
@@ -186,6 +237,75 @@ def save_snapshot(db, session_id, picture, source, captured_at_ms=None, deck_id=
     return db.execute("SELECT * FROM snapshots WHERE id=?", (sid,)).fetchone()
 
 
+def deck_public(row):
+    return {"deck_id": row["id"], "class_id": row["class_id"],
+            "filename": row["filename"], "slide_count": row["slide_count"],
+            "created_at_ms": row["created_at_ms"]}
+
+
+def pptx_bytes(raw, filename):
+    if filename.lower().endswith(".pptx"):
+        return raw
+    converter = shutil.which("soffice") or shutil.which("libreoffice")
+    if not converter:
+        raise HTTPException(422, "Legacy .ppt files need LibreOffice on the server. Save as .pptx and upload again.")
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "lecture.ppt"
+        source.write_bytes(raw)
+        try:
+            conversion = subprocess.run(
+                [converter, "--headless", "--convert-to", "pptx", "--outdir", directory, str(source)],
+                capture_output=True, timeout=45, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise HTTPException(422, "Could not convert this .ppt. Save it as .pptx and upload again.")
+        converted = Path(directory) / "lecture.pptx"
+        if conversion.returncode != 0 or not converted.exists():
+            raise HTTPException(422, "Could not convert this .ppt. Save it as .pptx and upload again.")
+        return converted.read_bytes()
+
+
+def extract_deck_slides(raw):
+    drawing = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    presentation = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    relationship = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            files = {info.filename: info for info in archive.infolist()}
+            if "ppt/presentation.xml" not in files or "ppt/_rels/presentation.xml.rels" not in files:
+                raise HTTPException(422, "This is not a readable PowerPoint deck")
+            if sum(info.file_size for info in files.values()) > 80 * 1024 * 1024:
+                raise HTTPException(413, "PowerPoint deck is too large after extraction")
+            root = ElementTree.fromstring(archive.read("ppt/presentation.xml"))
+            rels = ElementTree.fromstring(archive.read("ppt/_rels/presentation.xml.rels"))
+            targets = {item.get("Id"): item.get("Target", "") for item in rels.findall(f"{package}Relationship")}
+            slide_names = []
+            for item in root.iter(f"{presentation}sldId"):
+                target = targets.get(item.get(f"{relationship}id"), "")
+                name = target.lstrip("/") if target.startswith("/") else f"ppt/{target}"
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name) and name in files:
+                    slide_names.append(name)
+            if not slide_names or len(slide_names) > MAX_DECK_SLIDES:
+                raise HTTPException(422, f"Deck must have 1 to {MAX_DECK_SLIDES} readable slides")
+            slides = []
+            for number, name in enumerate(slide_names, 1):
+                if files[name].file_size > 2 * 1024 * 1024:
+                    raise HTTPException(413, "A slide contains too much XML data")
+                slide = ElementTree.fromstring(archive.read(name))
+                lines = []
+                for paragraph in slide.iter(f"{drawing}p"):
+                    line = "".join(node.text or "" for node in paragraph.iter(f"{drawing}t")).strip()
+                    if line:
+                        lines.append(line)
+                text = "\n".join(lines)[:6000]
+                slides.append({"slide_number": number, "title": lines[0][:120] if lines else f"Slide {number}", "text": text})
+            if not any(slide["text"] for slide in slides):
+                raise HTTPException(422, "No selectable text found in the slides. This version needs a deck with slide text.")
+            return slides
+    except (zipfile.BadZipFile, ElementTree.ParseError, KeyError, RuntimeError):
+        raise HTTPException(422, "This is not a readable PowerPoint deck")
+
+
 @app.get("/")
 def index():
     return FileResponse(ROOT / "static" / "index.html")
@@ -206,6 +326,8 @@ def create_session():
                    (id, started_epoch_ms, join_token, join_expires_epoch_ms)
                    VALUES (?,?,?,?)""",
                    (sid, started, token, started + PHONE_JOIN_LIFETIME_MS))
+        for name in ("Analysis of Algorithms", "Deep Learning"):
+            db.execute("INSERT INTO classes VALUES (?,?,?,?)", (new_id("class"), sid, name, started))
     return {"session_id": sid, "started_epoch_ms": started}
 
 
@@ -241,12 +363,104 @@ def get_session(session_id: str):
     with conn() as db:
         current = session(db, session_id)
         rows = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms DESC, slide_number", (session_id,)).fetchall()
-        messages = db.execute("SELECT * FROM messages WHERE session_id=? ORDER BY created_at_ms DESC LIMIT 30", (session_id,)).fetchall()
+        messages = db.execute("SELECT * FROM messages WHERE session_id=? ORDER BY created_at_ms, rowid", (session_id,)).fetchall()
         segments = db.execute("SELECT * FROM segments WHERE session_id=? ORDER BY start_ms DESC LIMIT 100", (session_id,)).fetchall()
+        chats = db.execute("SELECT id, title, class_id, created_at_ms FROM chats WHERE session_id=? ORDER BY created_at_ms DESC, rowid DESC", (session_id,)).fetchall()
+        classes = db.execute("SELECT id, name FROM classes WHERE session_id=? ORDER BY created_at_ms, rowid", (session_id,)).fetchall()
+        decks = db.execute("SELECT * FROM decks WHERE session_id=? ORDER BY created_at_ms DESC, rowid DESC", (session_id,)).fetchall()
     return {"session_id": session_id, "started_epoch_ms": current["started_epoch_ms"],
+            "server_epoch_ms": int(time.time() * 1000),
             "snapshots": [snapshot_public(r) for r in rows],
             "transcripts": [dict(r) for r in reversed(segments)],
-            "messages": [message_public(r) for r in reversed(messages)]}
+            "messages": [message_public(r) for r in messages],
+            "chats": [{"chat_id": r["id"], "title": r["title"], "class_id": r["class_id"], "created_at_ms": r["created_at_ms"]} for r in chats],
+            "classes": [{"class_id": r["id"], "name": r["name"]} for r in classes],
+            "decks": [deck_public(r) for r in decks]}
+
+
+@app.post("/api/sessions/{session_id}/decks")
+async def upload_deck(session_id: str, file: UploadFile = File(...), class_id: str = Form(...)):
+    filename = Path(file.filename or "").name[:120]
+    if not filename.lower().endswith((".ppt", ".pptx")):
+        raise HTTPException(422, "Choose a .ppt or .pptx PowerPoint file")
+    with conn() as db:
+        session(db, session_id)
+        if not db.execute("SELECT 1 FROM classes WHERE id=? AND session_id=?", (class_id, session_id)).fetchone():
+            raise HTTPException(404, "Class not found in this session")
+    raw = await file.read(MAX_DECK_UPLOAD + 1)
+    if len(raw) > MAX_DECK_UPLOAD:
+        raise HTTPException(413, "PowerPoint file exceeds 20 MB")
+    converted = await asyncio.to_thread(pptx_bytes, raw, filename)
+    slides = await asyncio.to_thread(extract_deck_slides, converted)
+    with conn() as db:
+        deck_id = new_id("deck")
+        db.execute("INSERT INTO decks VALUES (?,?,?,?,?,?)",
+                   (deck_id, session_id, class_id, filename, len(slides), int(time.time() * 1000)))
+        db.executemany("INSERT INTO deck_slides VALUES (?,?,?,?)",
+                       [(deck_id, slide["slide_number"], slide["title"], slide["text"]) for slide in slides])
+        deck = db.execute("SELECT * FROM decks WHERE id=?", (deck_id,)).fetchone()
+    return deck_public(deck)
+
+
+class ClassInput(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+
+
+@app.post("/api/sessions/{session_id}/classes")
+def create_class(session_id: str, body: ClassInput):
+    name = body.name.strip()
+    if len(name) < 2:
+        raise HTTPException(422, "Class name is too short")
+    with conn() as db:
+        session(db, session_id)
+        if db.execute("SELECT 1 FROM classes WHERE session_id=? AND lower(name)=lower(?)", (session_id, name)).fetchone():
+            raise HTTPException(409, "That class already exists")
+        class_id = new_id("class")
+        db.execute("INSERT INTO classes VALUES (?,?,?,?)", (class_id, session_id, name, int(time.time() * 1000)))
+    return {"class_id": class_id, "name": name}
+
+
+class ChatInput(BaseModel):
+    class_id: str | None = None
+
+
+@app.post("/api/sessions/{session_id}/chats")
+def create_chat(session_id: str, body: ChatInput | None = None):
+    with conn() as db:
+        session(db, session_id)
+        class_id = body.class_id if body else None
+        if class_id:
+            if not db.execute("SELECT 1 FROM classes WHERE id=? AND session_id=?", (class_id, session_id)).fetchone():
+                raise HTTPException(404, "Class not found in this session")
+        else:
+            class_id = db.execute("SELECT id FROM classes WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone()["id"]
+        chat_id = new_id("chat")
+        created_at_ms = int(time.time() * 1000)
+        db.execute("INSERT INTO chats (id,session_id,title,created_at_ms,class_id) VALUES (?,?,?,?,?)", (chat_id, session_id, "New chat", created_at_ms, class_id))
+    return {"chat_id": chat_id, "title": "New chat", "class_id": class_id, "created_at_ms": created_at_ms}
+
+
+@app.patch("/api/sessions/{session_id}/chats/{chat_id}")
+def move_chat(session_id: str, chat_id: str, body: ChatInput):
+    with conn() as db:
+        session(db, session_id)
+        if not db.execute("SELECT 1 FROM chats WHERE id=? AND session_id=?", (chat_id, session_id)).fetchone():
+            raise HTTPException(404, "Chat not found in this session")
+        if not body.class_id or not db.execute("SELECT 1 FROM classes WHERE id=? AND session_id=?", (body.class_id, session_id)).fetchone():
+            raise HTTPException(404, "Class not found in this session")
+        db.execute("UPDATE chats SET class_id=? WHERE id=?", (body.class_id, chat_id))
+    return {"chat_id": chat_id, "class_id": body.class_id}
+
+
+@app.delete("/api/sessions/{session_id}/chats/{chat_id}")
+def delete_chat(session_id: str, chat_id: str):
+    with conn() as db:
+        session(db, session_id)
+        if not db.execute("SELECT 1 FROM chats WHERE id=? AND session_id=?", (chat_id, session_id)).fetchone():
+            raise HTTPException(404, "Chat not found in this session")
+        db.execute("DELETE FROM messages WHERE chat_id=? AND session_id=?", (chat_id, session_id))
+        db.execute("DELETE FROM chats WHERE id=? AND session_id=?", (chat_id, session_id))
+    return {"deleted_chat_id": chat_id}
 
 
 @app.get("/api/sessions/{session_id}/context")
@@ -342,6 +556,15 @@ def image(snapshot_id: str):
     return FileResponse(row["path"], media_type="image/jpeg")
 
 
+@app.get("/api/snapshots/{snapshot_id}")
+def get_snapshot(snapshot_id: str):
+    with conn() as db:
+        row = db.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Snapshot not found")
+    return snapshot_public(row)
+
+
 class Region(BaseModel):
     x: float = Field(ge=0, le=1)
     y: float = Field(ge=0, le=1)
@@ -353,8 +576,11 @@ class Question(BaseModel):
     question: str = Field(min_length=2, max_length=1000)
     language: str = Field(default="en", pattern="^(en|es|fr|zh|hi|ko|ja|de|pt|ar)$")
     snapshot_id: str | None = None
+    snapshot_ids: list[str] | None = None
     region: Region | None = None
     asked_at_ms: int | None = Field(default=None, ge=0)
+    chat_id: str | None = None
+    selected_deck_ids: list[str] | None = None
 
 
 class Segment(BaseModel):
@@ -370,6 +596,17 @@ class Segment(BaseModel):
 
 class RecapRequest(BaseModel):
     language: str = Field(default="en", pattern="^(en|es|fr|zh|hi|ko|ja|de|pt|ar)$")
+
+
+@app.get("/api/sessions/{session_id}/transcript")
+def get_transcript(session_id: str):
+    with conn() as db:
+        session(db, session_id)
+        rows = db.execute("SELECT id, start_ms, end_ms, speaker, language, text FROM segments "
+                          "WHERE session_id=? ORDER BY start_ms DESC, rowid DESC LIMIT 20", (session_id,)).fetchall()
+    return {"segments": [{"segment_id": row["id"], "start_ms": row["start_ms"],
+                          "end_ms": row["end_ms"], "speaker": row["speaker"],
+                          "language": row["language"], "text": row["text"]} for row in reversed(rows)]}
 
 
 @app.post("/api/sessions/{session_id}/transcript")
@@ -395,7 +632,8 @@ def add_segment(session_id: str, segment: Segment):
 
 
 def message_public(row):
-    return {"message_id": row["id"], "snapshot_id": row["snapshot_id"],
+    return {"message_id": row["id"], "chat_id": row["chat_id"], "snapshot_id": row["snapshot_id"],
+            "snapshot_ids": json.loads(row["snapshot_ids_json"]) if row["snapshot_ids_json"] else ([row["snapshot_id"]] if row["snapshot_id"] else []),
             "region": json.loads(row["region_json"]) if row["region_json"] else None,
             "question": row["question"], "result": json.loads(row["answer_json"]),
             "created_at_ms": row["created_at_ms"]}
@@ -426,34 +664,147 @@ def nearby_segments(db, session_id, anchor_ms, limit=12):
     return sorted(rows, key=lambda row: row["start_ms"])
 
 
+def deck_context(decks, slides_by_deck):
+    if not decks:
+        return None, {}
+    count = sum(len(slides_by_deck[deck["id"]]) for deck in decks)
+    per_slide = max(60, min(1200, 16000 // max(1, count) - 90))
+    references = {}
+    entries = []
+    for deck in decks:
+        slides = []
+        for slide in slides_by_deck[deck["id"]]:
+            slide_id = f"{deck['id']}:{slide['slide_number']}"
+            references[slide_id] = f"{deck['filename']} · slide {slide['slide_number']}"
+            slides.append({"slide_id": slide_id, "slide_number": slide["slide_number"],
+                           "title": slide["title"], "extracted_text": slide["text"][:per_slide]})
+        entries.append({"filename": deck["filename"], "slides": slides})
+    return {"decks": entries, "limitation": "Only selectable slide text was extracted; embedded images, charts, and handwritten content are not included."}, references
+
+
+ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "visible_evidence": {"type": "array", "items": {"type": "string"}},
+        "inferred_explanation": {"type": "array", "items": {"type": "string"}},
+        "uncertainties": {"type": "array", "items": {"type": "string"}},
+        "transcript_segment_ids": {"type": "array", "items": {"type": "string"}},
+        "slide_references": {"type": "array", "items": {"type": "string"}},
+        "status": {"type": "string", "enum": ["supported", "partial", "unsupported"]},
+    },
+    "required": ["answer", "visible_evidence", "inferred_explanation", "uncertainties", "transcript_segment_ids", "slide_references", "status"],
+    "additionalProperties": False,
+}
+
+
+def parse_model_answer(response):
+    """Use the final text part; Gemini may include non-answer thought parts."""
+    data = response.json()
+    candidate = data["candidates"][0]
+    texts = [part["text"] for part in candidate["content"]["parts"]
+             if isinstance(part.get("text"), str) and not part.get("thought")]
+    for content in reversed(texts):
+        try:
+            answer = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(answer, dict) and isinstance(answer.get("answer"), str):
+            return answer
+    logger.warning("Unparseable model answer: finish_reason=%s text_parts=%s lengths=%s",
+                   candidate.get("finishReason"), len(texts), [len(t) for t in texts])
+    raise ValueError("Unparseable answer")
+
+
+def model_error_detail(status_code):
+    return {
+        400: "The model rejected this request. Try a different capture; check the server log if it repeats.",
+        401: "The Gemini API key was rejected. Check GEMINI_API_KEY in .env and restart the server.",
+        403: "This API key cannot access the model. Check the key's project and model access.",
+        413: "The captured images are too large for the model request. Try again with a different capture.",
+        429: "Gemini rate limit or quota reached. Wait and retry, or check your project's quota.",
+        500: "Gemini had a temporary server error. Retry this question.",
+        503: "Gemini is temporarily unavailable. Retry this question shortly.",
+    }.get(status_code, f"Gemini returned HTTP {status_code}. Retry this question or check the server log.")
+
+
 @app.post("/api/sessions/{session_id}/ask")
 async def ask(session_id: str, body: Question):
+    if body.snapshot_ids is not None:
+        if not 1 <= len(body.snapshot_ids) <= MAX_QUESTION_FRAMES or len(set(body.snapshot_ids)) != len(body.snapshot_ids):
+            raise HTTPException(422, "Select 1 to 4 distinct frames")
+        if body.snapshot_id and body.snapshot_id != body.snapshot_ids[0]:
+            raise HTTPException(422, "The primary snapshot must be the first selected frame")
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable answers")
     with conn() as db:
         session(db, session_id)
-        shot = None
-        if body.snapshot_id:
+        if body.chat_id:
+            chat = db.execute("SELECT id, class_id FROM chats WHERE id=? AND session_id=?", (body.chat_id, session_id)).fetchone()
+            if not chat:
+                raise HTTPException(404, "Chat not found in this session")
+            chat_id = chat["id"]
+        else:
+            chat = db.execute("SELECT id, class_id FROM chats WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone()
+            chat_id = chat["id"] if chat else None
+        class_row = ({"id": chat["class_id"]} if chat else db.execute(
+            "SELECT id FROM classes WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone())
+        if not class_row:
+            class_id = new_id("class")
+            db.execute("INSERT INTO classes (id,session_id,name,created_at_ms) VALUES (?,?,?,?)",
+                       (class_id, session_id, "Current lecture", int(time.time() * 1000)))
+        else:
+            class_id = class_row["id"]
+        available_decks = db.execute("SELECT * FROM decks WHERE session_id=? AND class_id=? ORDER BY created_at_ms DESC, rowid DESC",
+                                     (session_id, class_id)).fetchall()
+        selected_ids = body.selected_deck_ids
+        if selected_ids is None:
+            selected_ids = [available_decks[0]["id"]] if available_decks else []
+        if len(selected_ids) > 10 or len(selected_ids) != len(set(selected_ids)):
+            raise HTTPException(422, "Select up to 10 distinct PowerPoint decks")
+        available_by_id = {row["id"]: row for row in available_decks}
+        if any(deck_id not in available_by_id for deck_id in selected_ids):
+            raise HTTPException(422, "A selected PowerPoint deck does not belong to this class")
+        decks = [available_by_id[deck_id] for deck_id in selected_ids]
+        slides_by_deck = {deck["id"]: db.execute("SELECT * FROM deck_slides WHERE deck_id=? ORDER BY slide_number",
+                                                 (deck["id"],)).fetchall() for deck in decks}
+        if body.snapshot_ids is not None:
+            selected_shots = [db.execute("SELECT * FROM snapshots WHERE id=? AND session_id=?", (ident, session_id)).fetchone()
+                              for ident in body.snapshot_ids]
+            if any(item is None for item in selected_shots):
+                raise HTTPException(422, "A selected frame does not belong to this session")
+            shot = selected_shots[0]
+        elif body.snapshot_id:
             shot = db.execute("SELECT * FROM snapshots WHERE id=? AND session_id=?", (body.snapshot_id, session_id)).fetchone()
             if not shot:
                 raise HTTPException(404, "Snapshot not found in this lecture")
+            selected_shots = [shot]
         else:
-            shot = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms DESC LIMIT 1", (session_id,)).fetchone()
+            shot = None
+            selected_shots = []
         recent_shots = (db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
                                    (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
-                        if shot else [])
-        previous = db.execute("SELECT question, answer_json FROM messages WHERE session_id=? ORDER BY created_at_ms DESC LIMIT 8", (session_id,)).fetchall()
+                        if shot and len(selected_shots) == 1 else [])
+        previous = db.execute(
+            "SELECT question, answer_json FROM messages WHERE session_id=? AND (? IS NULL OR chat_id=?) ORDER BY created_at_ms DESC LIMIT 8",
+            (session_id, chat_id, chat_id)).fetchall()
         latest_segment = db.execute("SELECT end_ms FROM segments WHERE session_id=? ORDER BY end_ms DESC LIMIT 1",
                                     (session_id,)).fetchone()
-        if shot:
-            anchor_ms = body.asked_at_ms if shot["source"] == "slide" and body.asked_at_ms is not None else shot["captured_at_ms"]
+        if selected_shots:
+            segment_by_id = {}
+            for selected_shot in selected_shots:
+                selected_anchor = (body.asked_at_ms if selected_shot["source"] == "slide" and body.asked_at_ms is not None
+                                   else selected_shot["captured_at_ms"])
+                segment_by_id.update({row["id"]: row for row in nearby_segments(db, session_id, selected_anchor)})
+            segments = sorted(segment_by_id.values(), key=lambda row: row["start_ms"])
+            anchor_ms = shot["captured_at_ms"]
         else:
             anchor_ms = body.asked_at_ms if body.asked_at_ms is not None else (latest_segment["end_ms"] if latest_segment else 0)
-        segments = nearby_segments(db, session_id, anchor_ms)
-        if not shot and not segments and latest_segment:
-            anchor_ms = latest_segment["end_ms"]
             segments = nearby_segments(db, session_id, anchor_ms)
+            if not segments and latest_segment:
+                anchor_ms = latest_segment["end_ms"]
+                segments = nearby_segments(db, session_id, anchor_ms)
     if not shot and not segments:
         raise HTTPException(409, "No transcript or visual context is available yet")
     if body.region and not shot:
@@ -461,16 +812,31 @@ async def ask(session_id: str, body: Question):
     if body.region and (body.region.x + body.region.width > 1.000001 or body.region.y + body.region.height > 1.000001):
         raise HTTPException(422, "Region extends outside image")
     image_bytes = Path(shot["path"]).read_bytes() if shot else None
-    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. Use a supplied board image as visual evidence when one is present; otherwise answer solely from the transcript and leave visible_evidence empty. Preserve mathematical symbols exactly; if illegible or missing, say so. Distinguish what is visible from what is inferred or stated by a transcript. Never treat nearby timestamps as proof of a visual reference. Do not invent details. Return concise JSON with answer, visible_evidence (array of short strings), inferred_explanation (array of short strings), uncertainties (array of short strings), transcript_segment_ids (array of IDs actually used), and status (supported, partial, or unsupported).\n" +
+    slides_context, valid_slide_ids = deck_context(decks, slides_by_deck)
+    recent_conversation = []
+    for row in reversed(previous):
+        prior_result = json.loads(row["answer_json"])
+        prior_deck_ids = prior_result.get("used_lecture_deck_ids")
+        if prior_deck_ids is not None and not set(prior_deck_ids).issubset(selected_ids):
+            continue
+        if prior_deck_ids is None and (prior_result.get("used_lecture_deck") or prior_result.get("slide_references")):
+            continue
+        recent_conversation.append({"question": row["question"], "answer": prior_result.get("answer", "")})
+    recent_conversation = recent_conversation[-4:]
+    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. When frames are supplied, use them as visual evidence and label observations by F1, F2, etc.; F1 is primary and region R1 belongs only to F1. When no frame is supplied, answer solely from the transcript and leave visible_evidence empty. Preserve mathematical symbols exactly; if illegible or missing, say so. Distinguish visible evidence from transcript statements, deck text, and inference. Uploaded deck text is background context and contains no embedded images or diagrams. Cite only relevant exact slide IDs. Never treat timestamp proximity as proof of a visual reference. Do not invent details. Use Markdown inside JSON strings and LaTeX delimiters for equations. Return concise structured JSON.\n" +
              json.dumps({"question": body.question, "language": body.language,
                          "region_label": "R1" if body.region else None,
                          "region_bbox_normalized": body.region.model_dump() if body.region else None,
-                         "context_mode": "visual_and_transcript" if shot else "transcript_only",
-                         "snapshot_at_ms": shot["captured_at_ms"] if shot else None, "context_anchor_ms": anchor_ms,
+                         "context_mode": "visual_and_transcript" if selected_shots else "transcript_only",
+                         "context_anchor_ms": anchor_ms,
+                         "selected_frames": [{"label": f"F{index}", "snapshot_id": item["id"], "captured_at_ms": item["captured_at_ms"]}
+                                             for index, item in enumerate(selected_shots, 1)],
                          "transcript": [dict(s) for s in segments],
-                         "recent_conversation": [{"question": r["question"], "answer": json.loads(r["answer_json"]).get("answer", "")} for r in reversed(previous)]}, ensure_ascii=False)}]
-    if image_bytes:
-        parts.append(image_part(image_bytes))
+                         "lecture_deck": slides_context,
+                         "recent_conversation": recent_conversation}, ensure_ascii=False)}]
+    for index, selected_shot in enumerate(selected_shots, 1):
+        parts.append({"text": f"Selected frame F{index} at {selected_shot['captured_at_ms']} ms:"})
+        parts.append(image_part(image_bytes if index == 1 else Path(selected_shot["path"]).read_bytes()))
     for older in reversed(recent_shots):
         parts.append({"text": f"Earlier snapshot at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
         parts.append(image_part(Path(older["path"]).read_bytes()))
@@ -484,19 +850,25 @@ async def ask(session_id: str, body: Question):
         parts.append(image_part(crop.getvalue()))
     payload = {"contents": [{"role": "user", "parts": parts}],
                "generationConfig": {"responseMimeType": "application/json",
-                                    "responseSchema": ANSWER_RESPONSE_SCHEMA}}
+                                    "responseJsonSchema": ANSWER_SCHEMA,
+                                    "maxOutputTokens": 4096}}
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             res = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
                                     headers={"x-goog-api-key": key}, json=payload)
         res.raise_for_status()
-        content = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(content)
-        if not isinstance(result.get("answer"), str):
-            raise ValueError("Missing answer")
-    except (httpx.HTTPError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Model request failed: {type(exc).__name__}. Check server logs and model access")
-    used_segment_ids = [s for s in result.get("transcript_segment_ids", []) if s in {r["id"] for r in segments}]
+        result = parse_model_answer(res)
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Model HTTP status=%s", exc.response.status_code)
+        raise HTTPException(502, model_error_detail(exc.response.status_code))
+    except httpx.TimeoutException:
+        logger.warning("Model request timed out")
+        raise HTTPException(504, "The model took too long to answer. Retry this question.")
+    except (httpx.RequestError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Model response error: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not read the model answer. Please try again")
+    used_segment_ids = [segment_id for segment_id in result.get("transcript_segment_ids", [])
+                        if segment_id in {row["id"] for row in segments}]
     source_timestamps = [{"segment_id": row["id"], "start_ms": row["start_ms"], "end_ms": row["end_ms"]}
                          for row in segments if row["id"] in used_segment_ids]
     result = {"answer": result["answer"], "visible_evidence": result.get("visible_evidence", []) if shot else [],
@@ -504,13 +876,25 @@ async def ask(session_id: str, body: Question):
               "uncertainties": result.get("uncertainties", []),
               "transcript_segment_ids": used_segment_ids,
               "source_timestamps": source_timestamps,
+              "slide_references": [valid_slide_ids[slide_id] for slide_id in (result.get("slide_references") or [])
+                                   if isinstance(slide_id, str) and slide_id in valid_slide_ids],
+              "used_lecture_deck": bool(decks),
+              "used_lecture_deck_ids": selected_ids,
               "snapshot_at_ms": shot["captured_at_ms"] if shot else None,
               "status": result.get("status", "partial") if result.get("status") in ("supported", "partial", "unsupported") else "partial"}
     with conn() as db:
+        if chat_id is None:
+            chat_id = new_id("chat")
+            default_class = db.execute("SELECT id FROM classes WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone()["id"]
+            db.execute("INSERT INTO chats (id,session_id,title,created_at_ms,class_id) VALUES (?,?,?,?,?)",
+                       (chat_id, session_id, body.question[:64], int(time.time()*1000), default_class))
+        else:
+            db.execute("UPDATE chats SET title=? WHERE id=? AND title='New chat'", (body.question[:64], chat_id))
         ident = new_id("msg")
-        db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO messages (id,session_id,snapshot_id,region_json,question,answer_json,created_at_ms,chat_id,snapshot_ids_json) VALUES (?,?,?,?,?,?,?,?,?)",
                    (ident, session_id, shot["id"] if shot else None, body.region.model_dump_json() if body.region else None,
-                    body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000)))
+                    body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000), chat_id,
+                    json.dumps([item["id"] for item in selected_shots])))
         row = db.execute("SELECT * FROM messages WHERE id=?", (ident,)).fetchone()
     return message_public(row)
 

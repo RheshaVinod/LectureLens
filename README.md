@@ -1,6 +1,6 @@
 # LectureLens multimodal lecture companion
 
-LectureLens captures microphone audio and a board camera on one shared session clock. It creates live captions with optional translation, stores final transcript segments in SQLite, captures a board snapshot every four seconds, and accepts PDF or image slide uploads. Students can hold any snapshot or slide, select a region, and ask follow-up questions in ten languages. Gemini receives the selected visual, nearby timestamped transcript, earlier snapshots, and recent conversation; answers retain their evidence timestamps.
+LectureLens captures microphone audio and board images on one shared session clock. It creates live captions with optional translation, stores final transcript segments in SQLite, captures a laptop-camera snapshot every four seconds and whenever a caption finalizes, and accepts phone photos plus PDF/image slide uploads. The final interface organizes chats by class, supports selectable-text PowerPoint context, lets students compare up to four frames, zoom into a snapshot, select a region, and ask follow-up questions in ten languages. Gemini receives the chosen visuals, nearby timestamped transcript, selected deck text, and recent conversation; answers retain their evidence timestamps.
 
 ## Run
 
@@ -26,7 +26,7 @@ All times are integer milliseconds since session creation. The audio pipeline au
 - `GET /api/sessions/{session_id}/phone-join` — create a six-hour tokenized phone-camera link and QR URL.
 - `POST /api/sessions/{session_id}/slides` — PDF or image slide deck upload.
 - `GET /api/sessions/{session_id}/context` — full transcript, snapshot/slide, and Q&A history.
-- `POST /api/sessions/{session_id}/ask` — `{question,language,snapshot_id,region,asked_at_ms}`.
+- `POST /api/sessions/{session_id}/ask` — audio-only or multimodal Q&A with `{question,language,snapshot_id,snapshot_ids,region,asked_at_ms,chat_id,selected_deck_ids}`.
 - `POST /api/sessions/{session_id}/recap` — generate and persist a grounded study recap with `{language}`.
 - `GET /api/sessions/{session_id}/recap` — retrieve the latest generated recap.
 - `GET /api/sessions/{session_id}/recaps` — list every saved recap for the lecture.
