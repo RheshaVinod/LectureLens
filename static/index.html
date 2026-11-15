@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LectureLens</title>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('lecturelens-theme')||'light'}catch{document.documentElement.dataset.theme='light'}</script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.19.1/dist/katex.min.css">
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
   <div class="app-frame">
     <aside id="chatSidebar" class="chat-sidebar" aria-label="Chat history">
-      <div class="sidebar-rail"><button id="sidebarToggle" class="rail-button rail-chat" type="button" aria-label="Collapse chat sidebar" aria-controls="sidebarContent" aria-expanded="true" title="Toggle chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 2v-14a2 2 0 0 1 1-2z"/><path d="M8 9h8M8 13h6"/></svg></button></div>
+      <div class="sidebar-rail"><button id="sidebarToggle" class="rail-button rail-chat" type="button" aria-label="Collapse chat sidebar" aria-controls="sidebarContent" aria-expanded="true" title="Toggle chats"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="chat-bubble" d="M12 3.75c-4.7 0-8.5 3.23-8.5 7.23 0 1.76.74 3.39 1.99 4.65L4.25 20l4.3-1.51c1.05.42 2.22.64 3.45.64 4.7 0 8.5-3.23 8.5-7.2S16.7 3.75 12 3.75Z"/><circle class="chat-dot" cx="9" cy="11.4" r=".8"/><circle class="chat-dot" cx="12" cy="11.4" r=".8"/><circle class="chat-dot" cx="15" cy="11.4" r=".8"/></svg></button></div>
       <div id="sidebarContent" class="sidebar-content">
         <div class="sidebar-head"><span>YOUR CLASSES</span></div>
         <button id="newChat" class="new-chat" type="button"><span>＋</span> New chat</button>
@@ -26,7 +27,7 @@
     <div class="app-main">
   <main class="layout">
     <section class="visual-panel">
-      <div class="visual-head"><div class="visual-brand"><h1 class="brand"><span class="brand-mark">◎</span> LectureLens</h1></div><p>Point your camera at the board or lecture screen. LectureLens saves recent moments so you can ask at any time.</p></div>
+      <div class="visual-head"><div class="visual-brand"><h1 class="brand"><span class="brand-mark">◎</span> LectureLens</h1><button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode"><span aria-hidden="true">☾</span></button></div><p>Point your camera at the board or lecture screen. LectureLens saves recent moments so you can ask at any time.</p></div>
       <span id="captureStatus" class="sr-only" role="status" aria-live="polite"></span>
       <div class="stage" id="stage" tabindex="0" role="button" aria-label="Open current snapshot in a larger viewer">
         <video id="video" autoplay muted playsinline></video>
@@ -36,19 +37,19 @@
         <div class="stage-badge" id="stageBadge">Waiting for camera</div>
         <button id="expandImage" class="stage-expand" type="button" hidden aria-label="Expand snapshot">Expand ↗</button>
       </div>
-      <div class="capture-controls"><button id="startCamera" class="primary-button">Start camera <span>↗</span></button><button id="stopCamera" class="secondary-button" disabled>Stop capture</button><button id="uploadDeck" class="secondary-button" type="button" title="Upload .ppt or .pptx files for slide text context">Upload PPTs ↑</button><input id="slideFile" type="file" accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" multiple hidden><button id="selectRegion" class="secondary-button" disabled>Select a region</button><button id="useLatest" class="secondary-button" hidden>Use latest capture ↻</button><button id="clearRegion" class="text-button" hidden>Clear R1 ×</button></div>
+      <div id="captionBar" class="caption-bar"><div class="caption-head"><span class="caption-tag">CAPTIONS</span><div class="caption-actions"><label class="sr-only" for="captionLanguage">Caption language</label><select id="captionLanguage" aria-label="Caption language"><option value="en-US">EN</option><option value="hi-IN">HI</option></select><button id="captionToggle" type="button" aria-pressed="false" title="Start microphone captions">Start mic</button></div></div><div id="captionText" class="caption-text" role="log" aria-live="polite" aria-label="Live lecture captions" tabindex="0">Turn on the microphone for live captions.</div></div>
+      <div class="capture-controls"><button id="startCamera" class="primary-button">Start camera <span>↗</span></button><button id="stopCamera" class="secondary-button" disabled>Stop</button><button id="uploadDeck" class="secondary-button" type="button" title="Upload .ppt or .pptx files for slide text context">Add PPT ↑</button><input id="slideFile" type="file" accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation" multiple hidden><button id="selectRegion" class="secondary-button" disabled>Select region</button><button id="useLatest" class="secondary-button" hidden title="Use the latest camera capture">Latest ↻</button><button id="clearRegion" class="text-button" hidden>Clear R1 ×</button></div>
       <div id="deckStatus" class="deck-status" role="status" aria-live="polite" hidden></div>
-      <div id="deckPicker" class="deck-picker" hidden><div class="deck-picker-title">LECTURE PPTS <span>Choose decks to include</span></div><div id="deckList" class="deck-list"></div></div>
-      <div class="timeline-head"><span>RECENT MOMENTS</span><span id="momentCount">0 snapshots</span></div>
+      <div id="deckPicker" class="deck-picker" hidden><div class="deck-picker-title">PPT CONTEXT <span id="deckPickerCount"></span></div><div id="deckList" class="deck-list"></div></div>
+      <div class="timeline-head"><span>RECENT MOMENTS</span><div class="timeline-actions"><span id="momentCount">0 snapshots</span><button id="multiFrameToggle" class="frame-toggle" type="button" aria-pressed="false" title="Choose up to four snapshots for one question">Select frames</button></div></div>
       <div id="moments" class="moments"><div class="moment-placeholder">Snapshots will appear here every 4 seconds.</div></div>
       <p class="footnote"><span id="sessionStatus">Setting up session</span> · Capture stays in your browser until snapshots are sent to this session. Use a secure HTTPS page for camera access. <button id="copyLink" class="plain-button" type="button" title="Copy session link">Copy link ↗</button></p>
     </section>
     <section class="question-panel">
-      <div class="section-kicker"><span>ASK LECTURELENS</span><span class="live-dot">● READY WHEN YOU ARE</span></div>
       <div class="question-head"><h2>What did I miss?</h2><p>Ask about what you see, or choose a starting question.</p></div>
       <div class="preset-grid"><button class="preset" data-question="Can you explain what's happening on the board?">Explain what’s happening <span>↗</span></button><button class="preset" data-question="What does the current equation mean?">Explain the equation <span>↗</span></button><button class="preset" data-question="Summarize the most recent board snapshot.">I missed that <span>↗</span></button></div>
       <div id="conversation" class="conversation"><div class="welcome"><span class="welcome-icon">✳</span><strong>Clarity, one question at a time.</strong><p>Your answers will appear here with the snapshot they used.</p></div></div>
-      <form id="askForm" class="ask-form"><div id="selectedMoment" class="selected-moment">Using the latest capture as it updates</div><label for="question">YOUR QUESTION</label><textarea id="question" rows="2" placeholder="Why does this term become zero?"></textarea><div class="ask-bottom"><div class="ask-options"><label class="language-wrap" for="language">Answer in <select id="language"><option value="en">English</option><option value="hi">हिन्दी</option></select></label><label class="deck-use-label" for="useDeck"><input id="useDeck" type="checkbox" checked><span>Use PPT context</span></label></div><button id="askButton" class="primary-button" type="submit">Ask about this moment <span>→</span></button></div></form>
+      <form id="askForm" class="ask-form"><div id="selectedMoment" class="selected-moment">Latest capture</div><label class="sr-only" for="question">Question</label><textarea id="question" rows="2" placeholder="Ask about this moment…"></textarea><div class="ask-bottom"><div class="ask-options"><label class="language-wrap" for="language"><span class="sr-only">Answer language</span><select id="language" aria-label="Answer language"><option value="en">English</option><option value="hi">हिन्दी</option></select></label><label class="deck-use-label" for="useDeck"><input id="useDeck" type="checkbox" checked><span>Use PPT</span></label></div><button id="askButton" class="primary-button" type="submit">Ask <span>→</span></button></div></form>
     </section>
   </main>
     </div>

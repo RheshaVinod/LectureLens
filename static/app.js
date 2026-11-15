@@ -1,6 +1,14 @@
 const $ = id => document.getElementById(id);
-const state = {sessionId:null,stream:null,timer:null,snapshots:[],selected:null,region:null,selecting:false,pinned:false,busy:false,messages:[],allMessages:[],chats:[],classes:[],decks:[],uploadingDeck:false,deckUploadProgress:'',deckError:null,activeChatId:null,activeClassId:null,chatSelectionReady:false,deletingChatId:null,suppressStageClick:false,viewerZoom:1,viewerSelecting:false};
+const state = {sessionId:null,sessionStartedEpochMs:null,serverClockOffsetMs:0,stream:null,timer:null,snapshots:[],selected:null,selectedFrames:[],multiFrame:false,region:null,selecting:false,pinned:false,busy:false,messages:[],allMessages:[],chats:[],classes:[],decks:[],uploadingDeck:false,deckUploadProgress:'',deckError:null,activeChatId:null,activeClassId:null,chatSelectionReady:false,deletingChatId:null,suppressStageClick:false,viewerZoom:1,viewerSelecting:false,recognition:null,captionsWanted:false,captionsRunning:false,captionInterim:'',captionPreview:null,captionSegments:[],captionStarts:{},captionError:'',captionPolling:false};
 
+function applyTheme(theme){
+  document.documentElement.dataset.theme=theme;
+  const button=$('themeToggle');
+  const next=theme==='dark'?'light':'dark';
+  button.setAttribute('aria-label',`Switch to ${next} mode`);
+  button.title=`Switch to ${next} mode`;
+  button.firstElementChild.textContent=theme==='dark'?'☀':'☾';
+}
 function status(message, error=false){ $('captureStatus').textContent=message; $('captureStatus').style.color=error?'#a34534':''; if(error||message.startsWith('Requesting'))$('stageBadge').textContent=message; }
 async function api(path, options={}){
   const response=await fetch(path,options);
@@ -9,6 +17,81 @@ async function api(path, options={}){
   return data;
 }
 function elapsed(ms){const s=Math.floor(ms/1000);return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
+function captionTime(){return Math.max(0,Date.now()+state.serverClockOffsetMs-(state.sessionStartedEpochMs||Date.now()))}
+function renderCaptions(){
+  const preview=state.captionPreview;
+  const lines=state.captionSegments.map(item=>item.text.trim()).filter(Boolean);
+  if(preview&&!state.captionSegments.some(item=>item.text===preview.text&&item.end_ms===preview.end_ms))lines.push(preview.text);
+  if(state.captionInterim)lines.push(state.captionInterim);
+  const text=lines.join('\n');
+  const display=text||state.captionError||(state.captionsWanted?'Listening for speech…':'Turn on the microphone for live captions.');
+  const root=$('captionText');
+  if(root.textContent!==display){
+    const wasAtBottom=root.scrollHeight-root.clientHeight-root.scrollTop<24;
+    const previousScrollTop=root.scrollTop;
+    root.textContent=display;
+    root.scrollTop=wasAtBottom?root.scrollHeight:previousScrollTop;
+  }
+  root.classList.toggle('has-speech',!!text);
+  $('captionBar').classList.toggle('has-captions',!!text);
+  $('captionBar').classList.toggle('listening',state.captionsRunning);
+  $('captionToggle').textContent=state.captionsWanted?'Stop mic':'Start mic';
+  $('captionToggle').setAttribute('aria-pressed',String(state.captionsWanted));
+  $('captionToggle').title=state.captionsWanted?'Stop microphone captions':'Start microphone captions';
+  $('captionLanguage').disabled=state.captionsWanted;
+}
+async function pollCaptions(){
+  if(!state.sessionId||state.captionPolling)return;
+  state.captionPolling=true;
+  try{const data=await api(`/api/sessions/${state.sessionId}/transcript`);state.captionSegments=data.segments||[];
+    if(state.captionPreview&&state.captionSegments.some(item=>item.text===state.captionPreview.text&&item.end_ms===state.captionPreview.end_ms))state.captionPreview=null;
+    renderCaptions();
+  }catch(error){state.captionError=`Captions could not load: ${error.message}`;renderCaptions()}
+  finally{state.captionPolling=false}
+}
+async function saveCaption(text,startMs,endMs,language){
+  state.captionPreview={text,end_ms:endMs};renderCaptions();
+  try{await api(`/api/sessions/${state.sessionId}/transcript`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({start_ms:startMs,end_ms:endMs,speaker:'lecturer',language,text})});
+    await pollCaptions();
+  }catch(error){state.captionError=`Caption shown but could not be saved: ${error.message}`;renderCaptions()}
+}
+function stopCaptionMic(){
+  state.captionsWanted=false;state.captionsRunning=false;state.captionInterim='';
+  state.recognition?.stop();state.recognition=null;renderCaptions();
+}
+function startCaptionMic(){
+  const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!window.isSecureContext||!SpeechRecognition){state.captionError='Live microphone captions need Chrome on localhost or HTTPS.';renderCaptions();return}
+  state.captionError='';state.captionStarts={};state.captionInterim='';state.captionsWanted=true;
+  const recognition=new SpeechRecognition();state.recognition=recognition;
+  recognition.continuous=true;recognition.interimResults=true;recognition.lang=$('captionLanguage').value;
+  recognition.onstart=()=>{state.captionsRunning=true;renderCaptions()};
+  recognition.onresult=event=>{
+    const interim=[];
+    for(let index=0;index<event.results.length;index++){
+      const result=event.results[index],text=result[0]?.transcript?.trim();if(!text)continue;
+      if(result.isFinal){if(index<event.resultIndex)continue;
+        const endMs=captionTime(),startMs=state.captionStarts[index]??endMs;
+        delete state.captionStarts[index];saveCaption(text,startMs,endMs,recognition.lang.startsWith('hi')?'hi':'en');
+      }else{state.captionStarts[index]??=captionTime();interim.push(text)}
+    }
+    state.captionInterim=interim.join(' ');renderCaptions();
+  };
+  recognition.onerror=event=>{
+    if(event.error==='no-speech'||event.error==='aborted'&&!state.captionsWanted)return;
+    state.captionError=event.error==='not-allowed'||event.error==='service-not-allowed'?'Microphone permission was blocked. Allow it in Chrome and retry.':
+      event.error==='audio-capture'?'No microphone is available.':`Microphone captions stopped: ${event.error}`;
+    state.captionsWanted=false;state.captionsRunning=false;renderCaptions();
+  };
+  recognition.onend=()=>{
+    state.captionsRunning=false;
+    if(state.captionsWanted){setTimeout(()=>{if(state.captionsWanted&&state.recognition===recognition){try{recognition.start()}catch{state.captionsWanted=false;state.captionError='Microphone captions stopped. Try starting again.';renderCaptions()}}},300)}
+    else renderCaptions();
+  };
+  try{recognition.start()}catch(error){state.captionsWanted=false;state.captionError=`Could not start microphone captions: ${error.message}`}
+  renderCaptions();
+}
 function deckKey(suffix){return `lecturelens-${suffix}:${state.sessionId}:${state.activeClassId}`}
 function disabledDeckIds(){try{return JSON.parse(localStorage.getItem(deckKey('disabled-decks'))||'[]')}catch{return []}}
 function currentDecks(){return state.decks.filter(item=>item.class_id===state.activeClassId)}
@@ -24,17 +107,17 @@ function renderDeckStatus(){
   toggle.checked=!!decks.length&&localStorage.getItem(deckKey('use-deck'))!=='false';
   const selected=new Set(selectedDeckIds());
   const picker=$('deckPicker'),list=$('deckList');picker.hidden=!decks.length;list.replaceChildren();
+  $('deckPickerCount').textContent=toggle.checked?`${selected.size}/${decks.length} · text only`:'Off · text only';
   for(const deck of decks){
     const label=document.createElement('label');label.className='deck-choice';label.title=deck.filename;
-    const input=document.createElement('input');input.type='checkbox';input.checked=!disabledDeckIds().includes(deck.deck_id);input.setAttribute('aria-label',`Use ${deck.filename}`);
+    const input=document.createElement('input');input.type='checkbox';input.checked=!disabledDeckIds().includes(deck.deck_id);input.disabled=!toggle.checked;input.setAttribute('aria-label',`Use ${deck.filename}`);
     input.onchange=()=>{const disabled=new Set(disabledDeckIds());if(input.checked)disabled.delete(deck.deck_id);else disabled.add(deck.deck_id);
       localStorage.setItem(deckKey('disabled-decks'),JSON.stringify([...disabled]));state.deckError=null;renderDeckStatus()};
     const name=document.createElement('span');name.className='deck-choice-name';name.textContent=deck.filename;
     const count=document.createElement('span');count.className='deck-choice-count';count.textContent=`${deck.slide_count} slide${deck.slide_count===1?'':'s'}`;
     label.append(input,name,count);list.append(label);
   }
-  const message=state.uploadingDeck?state.deckUploadProgress:state.deckError||
-    (decks.length?`${decks.length} PPT${decks.length===1?'':'s'} uploaded · ${toggle.checked?`${selected.size} selected`:'PPT context off'} · slide text only`:'');
+  const message=state.uploadingDeck?state.deckUploadProgress:state.deckError||'';
   element.hidden=!message;element.textContent=message;element.classList.toggle('error',!!state.deckError&&!state.uploadingDeck);
   $('uploadDeck').disabled=state.uploadingDeck;
 }
@@ -73,7 +156,7 @@ function showMedia(){
   $('selectRegion').disabled=!state.snapshots.length;
   $('expandImage').hidden=!state.selected;
   $('useLatest').hidden=!state.pinned;
-  $('selectedMoment').textContent=state.pinned&&state.selected?`Selected capture ${elapsed(state.selected.captured_at_ms)}${state.region?' · Region R1':''} — held while you type`:state.selected?'Using the latest capture as it updates':'Start camera to capture a moment';
+  $('selectedMoment').textContent=state.multiFrame&&state.selectedFrames.length?`${state.selectedFrames.length} selected frame${state.selectedFrames.length===1?'':'s'} · F1 ${elapsed(state.selectedFrames[0].captured_at_ms)}${state.region?' · R1 on F1':''}`:state.pinned&&state.selected?`Pinned capture · ${elapsed(state.selected.captured_at_ms)}${state.region?' · R1':''}`:state.selected?'Latest capture':'Start camera for a capture';
   drawRegion();
 }
 function drawRegion(){
@@ -88,12 +171,42 @@ function drawRegion(){
 }
 function renderMoments(){
   const target=$('moments');target.replaceChildren();$('momentCount').textContent=`${state.snapshots.length} recent snapshot${state.snapshots.length===1?'':'s'}`;
+  $('multiFrameToggle').disabled=!state.snapshots.length;
+  $('multiFrameToggle').setAttribute('aria-pressed',String(state.multiFrame));
+  $('multiFrameToggle').textContent=state.multiFrame?'Clear frames':'Select frames';
   if(!state.snapshots.length){const p=document.createElement('div');p.className='moment-placeholder';p.textContent='Snapshots will appear here every 4 seconds.';target.append(p);return}
-  for(const shot of state.snapshots){const button=document.createElement('button');button.className='moment'+(state.selected?.snapshot_id===shot.snapshot_id?' active':'');button.title=`Snapshot at ${elapsed(shot.captured_at_ms)}`;
-    const img=document.createElement('img');img.src=shot.image_url;img.alt=button.title;const label=document.createElement('span');label.textContent=elapsed(shot.captured_at_ms);button.append(img,label);
-    button.onclick=()=>selectSnapshot(shot,true);target.append(button)}
+  const visible=[...state.selectedFrames,...state.snapshots.filter(shot=>!state.selectedFrames.some(item=>item.snapshot_id===shot.snapshot_id))];
+  for(const shot of visible){const frameIndex=state.multiFrame?state.selectedFrames.findIndex(item=>item.snapshot_id===shot.snapshot_id):-1;
+    const button=document.createElement('button');button.className='moment'+(state.selected?.snapshot_id===shot.snapshot_id?' active':'')+(frameIndex>=0?' frame-selected':'');
+    button.title=state.multiFrame?`${frameIndex>=0?'Remove':'Add'} snapshot at ${elapsed(shot.captured_at_ms)}${frameIndex<0?' (up to 4)':''}`:`Snapshot at ${elapsed(shot.captured_at_ms)}`;
+    button.setAttribute('aria-pressed',String(frameIndex>=0));
+    const img=document.createElement('img');img.src=shot.image_url;img.alt=`Snapshot at ${elapsed(shot.captured_at_ms)}`;
+    const label=document.createElement('span');label.textContent=elapsed(shot.captured_at_ms);button.append(img,label);
+    if(frameIndex>=0){const badge=document.createElement('b');badge.className='frame-number';badge.textContent=`F${frameIndex+1}`;button.append(badge)}
+    button.onclick=()=>state.multiFrame?toggleFrame(shot):selectSnapshot(shot,true);target.append(button)}
 }
-function selectSnapshot(shot,pinned=false){state.selected=shot;state.pinned=pinned;state.region=null;state.selecting=false;$('selectRegion').textContent='Select a region';$('stage').classList.remove('selecting');$('snapshot').src=shot.image_url;$('clearRegion').hidden=true;showMedia();renderMoments()}
+function selectSnapshot(shot,pinned=false,keepFrames=false){
+  if(!keepFrames){state.multiFrame=false;state.selectedFrames=[]}
+  state.selected=shot;state.pinned=pinned;state.region=null;state.selecting=false;$('selectRegion').textContent='Select region';$('stage').classList.remove('selecting');$('snapshot').src=shot.image_url;$('clearRegion').hidden=true;showMedia();renderMoments()
+}
+function toggleFrame(shot){
+  const index=state.selectedFrames.findIndex(item=>item.snapshot_id===shot.snapshot_id);
+  if(index>=0){
+    if(state.selectedFrames.length===1)return;
+    state.selectedFrames.splice(index,1);
+    if(index===0)selectSnapshot(state.selectedFrames[0],true,true);
+  }else{
+    if(state.selectedFrames.length>=4){status('Choose up to 4 frames per question',true);return}
+    state.selectedFrames.push(shot);
+  }
+  showMedia();renderMoments();
+}
+function startFrameSelection(){
+  if(!state.selected)return;
+  if(state.multiFrame){state.multiFrame=false;state.selectedFrames=[]}
+  else{state.multiFrame=true;state.selectedFrames=[state.selected];state.pinned=true}
+  showMedia();renderMoments();
+}
 function renderChats(){
   const list=$('chatList');list.replaceChildren();
   for(const lectureClass of state.classes){
@@ -167,12 +280,21 @@ async function deleteChat(){
   }catch(error){$('deleteChatDescription').textContent=error.message}
   finally{$('confirmDeleteChat').disabled=false}
 }
-async function showMessageSnapshot(message){
+async function showMessageSnapshot(message,clickedSnapshotId=null){
   if(!message)return;
   try{
-    const shot=state.snapshots.find(s=>s.snapshot_id===message.snapshot_id)||await api(`/api/snapshots/${message.snapshot_id}`);
+    const ids=message.snapshot_ids?.length?message.snapshot_ids:[message.snapshot_id];
+    const shots=await Promise.all(ids.map(ident=>state.snapshots.find(s=>s.snapshot_id===ident)||api(`/api/snapshots/${ident}`)));
     if(state.activeChatId!==message.chat_id)return;
-    selectSnapshot(shot,true);state.region=message.region;showMedia();
+    const primary=shots[0];selectSnapshot(primary,true);
+    if(ids.length>1){state.multiFrame=true;state.selectedFrames=shots}
+    if(clickedSnapshotId&&clickedSnapshotId!==primary.snapshot_id){
+      state.selected=shots.find(item=>item.snapshot_id===clickedSnapshotId)||primary;
+      state.selectedFrames=[state.selected,...shots.filter(item=>item.snapshot_id!==clickedSnapshotId)];
+      $('snapshot').src=state.selected.image_url;
+      state.region=null;
+    }else state.region=message.region;
+    showMedia();renderMoments();
   }catch(e){status(e.message,true)}
 }
 function switchChat(chatId){
@@ -196,7 +318,10 @@ async function createChat(classId=state.activeClassId){
 }
 async function refresh(){
   if(!state.sessionId)return;
-  try{const data=await api(`/api/sessions/${state.sessionId}`);state.snapshots=data.snapshots;state.decks=data.decks||[];
+  try{const requestedAt=Date.now(),data=await api(`/api/sessions/${state.sessionId}`);
+    state.sessionStartedEpochMs=data.started_epoch_ms;
+    state.serverClockOffsetMs=data.server_epoch_ms-Math.round((requestedAt+Date.now())/2);
+    state.snapshots=data.snapshots;state.decks=data.decks||[];
     if(!state.selected&&state.snapshots.length)selectSnapshot(state.snapshots[0]);
     else if(state.selected&&state.stream&&!state.pinned&&!state.region&&!state.selecting&&state.selected.snapshot_id!==state.snapshots[0]?.snapshot_id)selectSnapshot(state.snapshots[0]);
     renderMoments();
@@ -225,7 +350,7 @@ async function capture(){
   if(!blob)return;const form=new FormData();form.append('image',blob,'snapshot.jpg');form.append('source','camera');
   try{const shot=await api(`/api/sessions/${state.sessionId}/snapshots`,{method:'POST',body:form});
     state.snapshots.unshift(shot);state.snapshots=state.snapshots.slice(0,12);
-    if(!state.pinned&&!state.region&&!state.selecting)selectSnapshot(shot);else renderMoments();
+    if(!state.pinned&&!state.region&&!state.selecting&&!state.multiFrame)selectSnapshot(shot);else renderMoments();
     status(`Capturing · latest at ${elapsed(shot.captured_at_ms)}`)
   }catch(e){status(e.message,true)}
 }
@@ -297,8 +422,15 @@ let viewerDragStart=null;
 function renderMessages(){document.body.classList.toggle('chat-active',state.messages.length>0||state.busy);const root=$('conversation');root.replaceChildren();if(!state.messages.length){root.innerHTML='<div class="welcome"><span class="welcome-icon">✳</span><strong>Clarity, one question at a time.</strong><p>Your answers will appear here with the snapshot they used.</p></div>';return}
   for(const message of state.messages){const entry=document.createElement('article');entry.className='entry';const q=document.createElement('div');q.className='entry-question';q.textContent=message.question;
     const a=document.createElement('div');a.className='entry-answer';renderRichText(a,message.result.answer);
-    const meta=document.createElement('div');meta.className='entry-meta';const shot=state.snapshots.find(s=>s.snapshot_id===message.snapshot_id);const thumb=document.createElement('img');thumb.src=`/api/snapshots/${message.snapshot_id}/image`;thumb.alt='Evidence snapshot';const label=document.createElement('span');label.textContent=shot?`Snapshot ${elapsed(shot.captured_at_ms)}${message.region?' · Region R1':''}`:`Evidence snapshot${message.region?' · Region R1':''}`;
-    meta.append(thumb,label);meta.onclick=()=>showMessageSnapshot(message);meta.style.cursor='pointer';entry.append(q,a,meta);
+    const meta=document.createElement('div');meta.className='entry-meta frame-evidence';
+    for(const [index,ident] of (message.snapshot_ids?.length?message.snapshot_ids:[message.snapshot_id]).entries()){
+      const shot=state.snapshots.find(s=>s.snapshot_id===ident)||state.selectedFrames.find(s=>s.snapshot_id===ident);
+      const frame=document.createElement('button');frame.type='button';frame.className='evidence-frame';frame.title=`Open frame F${index+1}`;
+      const thumb=document.createElement('img');thumb.src=`/api/snapshots/${ident}/image`;thumb.alt=`Evidence frame F${index+1}`;
+      const label=document.createElement('span');label.textContent=`F${index+1}${shot?` · ${elapsed(shot.captured_at_ms)}`:''}${index===0&&message.region?' · R1':''}`;
+      frame.append(thumb,label);frame.onclick=()=>showMessageSnapshot(message,ident);meta.append(frame);
+    }
+    entry.append(q,a,meta);
     for(const [title,list] of [['Visible',message.result.visible_evidence],['Slides',message.result.slide_references],['Explanation',message.result.inferred_explanation],['Uncertain',message.result.uncertainties]]){if(Array.isArray(list)&&list.length){const line=document.createElement('div');line.className='evidence';const strong=document.createElement('strong');strong.textContent=title+' · ';const content=document.createElement('span');renderRichText(content,list.join(' · '));line.append(strong,content);entry.append(line)}}root.append(entry)}root.scrollTop=root.scrollHeight;
 }
 function showQuestionState(question,message,error=false){
@@ -308,7 +440,7 @@ function showQuestionState(question,message,error=false){
   pending.append(q,answer);root.append(pending);root.scrollTop=root.scrollHeight;
   return answer;
 }
-async function ask(question,snapshotId=null,regionOverride=undefined,deckIdsOverride=undefined){if(state.busy)return;if(!state.snapshots.length&&!snapshotId){
+async function ask(question,snapshotId=null,regionOverride=undefined,deckIdsOverride=undefined,frameIdsOverride=undefined){if(state.busy)return;if(!state.snapshots.length&&!snapshotId){
     status('Start camera capture first',true);
     const root=$('conversation');root.replaceChildren();showQuestionState(question,'Start the camera and wait for a snapshot to appear, then try this question again.',true);
     return;
@@ -319,21 +451,27 @@ async function ask(question,snapshotId=null,regionOverride=undefined,deckIdsOver
   if(deckIds.length>10){showQuestionState(question,'Choose up to 10 PPTs for one question.',true);return}
   state.busy=true;document.body.classList.add('chat-active');$('askButton').disabled=true;$('askButton').firstChild.textContent='Thinking… ';
   document.querySelectorAll('.preset').forEach(button=>button.disabled=true);
-  const shot=snapshotId?{snapshot_id:snapshotId}:state.selected||state.snapshots[0];
+  const frameIds=frameIdsOverride===undefined?(state.multiFrame?state.selectedFrames.map(item=>item.snapshot_id):null):frameIdsOverride;
+  const shot=snapshotId?{snapshot_id:snapshotId}:state.multiFrame?state.selectedFrames[0]:state.selected||state.snapshots[0];
   const region=regionOverride===undefined?state.region:regionOverride;
   const root=$('conversation');if(!state.messages.length)root.replaceChildren();
-  const pending=showQuestionState(question,deckIds.length?'Looking at the selected capture and PPTs…':'Looking at the selected capture…');
-  try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:$('language').value,snapshot_id:shot.snapshot_id,region,chat_id:chatId,selected_deck_ids:deckIds})});state.messages.push(message);state.allMessages.push(message);
+  const pending=showQuestionState(question,frameIds?.length>1?`Looking at ${frameIds.length} selected frames${deckIds.length?' and PPTs':''}…`:deckIds.length?'Looking at the selected capture and PPTs…':'Looking at the selected capture…');
+  try{const message=await api(`/api/sessions/${state.sessionId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:$('language').value,snapshot_id:shot.snapshot_id,snapshot_ids:frameIds,region,chat_id:chatId,selected_deck_ids:deckIds})});state.messages.push(message);state.allMessages.push(message);
     const chat=state.chats.find(item=>item.chat_id===chatId);if(chat&&chat.title==='New chat')chat.title=question.slice(0,64);
     renderChats();renderMessages();$('question').value=''}
   catch(e){pending.className='error';pending.textContent=e.message;
     const retry=document.createElement('button');retry.type='button';retry.className='secondary-button retry-button';retry.textContent='Retry question ↻';
-    retry.onclick=()=>{pending.parentElement?.remove();ask(question,shot.snapshot_id,region,deckIds)};
+    retry.onclick=()=>{pending.parentElement?.remove();ask(question,shot.snapshot_id,region,deckIds,frameIds)};
     pending.parentElement.append(retry);pending.parentElement.classList.add('failed-entry');
   }
-  finally{state.busy=false;$('askButton').disabled=false;$('askButton').firstChild.textContent='Ask about this moment ';document.querySelectorAll('.preset').forEach(button=>button.disabled=false)}
+  finally{state.busy=false;$('askButton').disabled=false;$('askButton').firstChild.textContent='Ask ';document.querySelectorAll('.preset').forEach(button=>button.disabled=false)}
 }
 async function init(){const params=new URLSearchParams(location.search);state.sessionId=params.get('session');
+  applyTheme(document.documentElement.dataset.theme==='dark'?'dark':'light');
+  renderCaptions();
+  $('captionToggle').onclick=()=>state.captionsWanted?stopCaptionMic():startCaptionMic();
+  window.addEventListener('pagehide',stopCaptionMic);
+  $('themeToggle').onclick=()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';applyTheme(theme);localStorage.setItem('lecturelens-theme',theme)};
   try{if(state.sessionId)await refresh();else{const result=await api('/api/sessions',{method:'POST'});state.sessionId=result.session_id;history.replaceState({},'',`?session=${state.sessionId}`);await refresh()}
     if(!state.chats.length)await createChat();
     else if(state.messages.length)showMessageSnapshot(state.messages[state.messages.length-1]);
@@ -364,7 +502,8 @@ async function init(){const params=new URLSearchParams(location.search);state.se
     catch(error){$('classError').textContent=error.message;$('classError').hidden=false}
   };
   $('copyLink').onclick=async()=>{await navigator.clipboard.writeText(location.href);$('copyLink').textContent='Copied ✓';setTimeout(()=>$('copyLink').textContent='Copy link ↗',1800)};
-  $('selectRegion').onclick=()=>{state.selecting=!state.selecting;if(state.selecting)state.pinned=true;$('stage').classList.toggle('selecting',state.selecting);$('selectRegion').textContent=state.selecting?'Drag on the snapshot':'Select a region';showMedia()};
+  $('selectRegion').onclick=()=>{state.selecting=!state.selecting;if(state.selecting)state.pinned=true;$('stage').classList.toggle('selecting',state.selecting);$('selectRegion').textContent=state.selecting?'Drag to select':'Select region';showMedia()};
+  $('multiFrameToggle').onclick=startFrameSelection;
   $('useLatest').onclick=()=>{if(state.snapshots.length)selectSnapshot(state.snapshots[0]);};
   $('clearRegion').onclick=()=>{state.region=null;$('clearRegion').hidden=true;showMedia()};
   $('stage').onclick=()=>{if(state.suppressStageClick){state.suppressStageClick=false;return}openImageViewer()};
@@ -402,12 +541,12 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   $('viewerImageFrame').addEventListener('pointercancel',()=>{viewerDragStart=null;drawViewerSelection()});
   $('stage').addEventListener('pointerdown',e=>{if(!state.selecting||!state.selected)return;dragStart=imagePoint(e);$('stage').setPointerCapture(e.pointerId)});
   $('stage').addEventListener('pointermove',e=>{if(!dragStart)return;const p=imagePoint(e);state.region={x:Math.min(p.x,dragStart.x),y:Math.min(p.y,dragStart.y),width:Math.abs(p.x-dragStart.x),height:Math.abs(p.y-dragStart.y)};drawRegion()});
-  $('stage').addEventListener('pointerup',e=>{if(!dragStart)return;dragStart=null;state.suppressStageClick=true;if(state.region.width<.01||state.region.height<.01){state.region=null;drawRegion();return}state.selecting=false;$('stage').classList.remove('selecting');$('selectRegion').textContent='Select a region';$('clearRegion').hidden=false;showMedia()});
+  $('stage').addEventListener('pointerup',e=>{if(!dragStart)return;dragStart=null;state.suppressStageClick=true;if(state.region.width<.01||state.region.height<.01){state.region=null;drawRegion();return}state.selecting=false;$('stage').classList.remove('selecting');$('selectRegion').textContent='Select region';$('clearRegion').hidden=false;showMedia()});
   window.addEventListener('resize',()=>{drawRegion();if($('imageViewer').open)layoutViewerImage()});
   new ResizeObserver(drawRegion).observe($('stage'));
   document.querySelectorAll('.preset').forEach(button=>button.onclick=()=>{
     if(button.textContent.includes('I missed that')&&state.messages.length){const last=state.messages[state.messages.length-1];
-      const shot=state.snapshots.find(s=>s.snapshot_id===last.snapshot_id);if(shot){selectSnapshot(shot,true);state.region=last.region;showMedia()}
+      const shot=state.snapshots.find(s=>s.snapshot_id===last.snapshot_id);showMessageSnapshot(last);
       const root=$('conversation');root.querySelector('.recap-entry')?.remove();
       const recap=document.createElement('article');recap.className='entry recap-entry';
       const heading=document.createElement('div');heading.className='entry-question';heading.textContent='I missed that';
@@ -419,6 +558,7 @@ async function init(){const params=new URLSearchParams(location.search);state.se
     ask(button.dataset.question)
   });
   $('askForm').onsubmit=e=>{e.preventDefault();const q=$('question').value.trim();if(q)ask(q)};
+  pollCaptions();setInterval(pollCaptions,1500);
   setInterval(refresh,5000);
 }
 init();

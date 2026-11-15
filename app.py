@@ -35,6 +35,7 @@ logger = logging.getLogger("lecturelens")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_DECK_UPLOAD = 20 * 1024 * 1024
 MAX_DECK_SLIDES = 100
+MAX_QUESTION_FRAMES = 4
 Image.MAX_IMAGE_PIXELS = 24_000_000
 
 app = FastAPI(title="LectureLens")
@@ -76,6 +77,8 @@ with conn() as db:
     """)
     if "chat_id" not in {column[1] for column in db.execute("PRAGMA table_info(messages)")}:
         db.execute("ALTER TABLE messages ADD COLUMN chat_id TEXT")
+    if "snapshot_ids_json" not in {column[1] for column in db.execute("PRAGMA table_info(messages)")}:
+        db.execute("ALTER TABLE messages ADD COLUMN snapshot_ids_json TEXT")
     # Older sessions had a single message stream. Keep it as one saved chat.
     legacy_sessions = db.execute("SELECT DISTINCT session_id FROM messages WHERE chat_id IS NULL").fetchall()
     for row in legacy_sessions:
@@ -201,13 +204,15 @@ def create_session():
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str):
     with conn() as db:
-        session(db, session_id)
+        current = session(db, session_id)
         rows = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms DESC LIMIT 12", (session_id,)).fetchall()
         messages = db.execute("SELECT * FROM messages WHERE session_id=? ORDER BY created_at_ms, rowid", (session_id,)).fetchall()
         chats = db.execute("SELECT id, title, class_id, created_at_ms FROM chats WHERE session_id=? ORDER BY created_at_ms DESC, rowid DESC", (session_id,)).fetchall()
         classes = db.execute("SELECT id, name FROM classes WHERE session_id=? ORDER BY created_at_ms, rowid", (session_id,)).fetchall()
         decks = db.execute("SELECT * FROM decks WHERE session_id=? ORDER BY created_at_ms DESC, rowid DESC", (session_id,)).fetchall()
-    return {"session_id": session_id, "snapshots": [snapshot_public(r) for r in rows],
+    return {"session_id": session_id, "started_epoch_ms": current["started_epoch_ms"],
+            "server_epoch_ms": int(time.time() * 1000),
+            "snapshots": [snapshot_public(r) for r in rows],
             "messages": [message_public(r) for r in messages],
             "chats": [{"chat_id": r["id"], "title": r["title"], "class_id": r["class_id"], "created_at_ms": r["created_at_ms"]} for r in chats],
             "classes": [{"class_id": r["id"], "name": r["name"]} for r in classes],
@@ -356,6 +361,7 @@ class Question(BaseModel):
     question: str = Field(min_length=2, max_length=1000)
     language: str = Field(default="en", pattern="^(en|hi)$")
     snapshot_id: str | None = None
+    snapshot_ids: list[str] | None = None
     region: Region | None = None
     chat_id: str | None = None
     selected_deck_ids: list[str] | None = None
@@ -368,6 +374,17 @@ class Segment(BaseModel):
     speaker: str = "lecturer"
     language: str = "en"
     text: str = Field(min_length=1)
+
+
+@app.get("/api/sessions/{session_id}/transcript")
+def get_transcript(session_id: str):
+    with conn() as db:
+        session(db, session_id)
+        rows = db.execute("SELECT id, start_ms, end_ms, speaker, language, text FROM segments "
+                          "WHERE session_id=? ORDER BY start_ms DESC, rowid DESC LIMIT 20", (session_id,)).fetchall()
+    return {"segments": [{"segment_id": row["id"], "start_ms": row["start_ms"],
+                          "end_ms": row["end_ms"], "speaker": row["speaker"],
+                          "language": row["language"], "text": row["text"]} for row in reversed(rows)]}
 
 
 @app.post("/api/sessions/{session_id}/transcript")
@@ -385,6 +402,7 @@ def add_segment(session_id: str, segment: Segment):
 
 def message_public(row):
     return {"message_id": row["id"], "chat_id": row["chat_id"], "snapshot_id": row["snapshot_id"],
+            "snapshot_ids": json.loads(row["snapshot_ids_json"]) if row["snapshot_ids_json"] else [row["snapshot_id"]],
             "region": json.loads(row["region_json"]) if row["region_json"] else None,
             "question": row["question"], "result": json.loads(row["answer_json"]),
             "created_at_ms": row["created_at_ms"]}
@@ -460,6 +478,11 @@ def model_error_detail(status_code):
 
 @app.post("/api/sessions/{session_id}/ask")
 async def ask(session_id: str, body: Question):
+    if body.snapshot_ids is not None:
+        if not 1 <= len(body.snapshot_ids) <= MAX_QUESTION_FRAMES or len(set(body.snapshot_ids)) != len(body.snapshot_ids):
+            raise HTTPException(422, "Select 1 to 4 distinct frames")
+        if body.snapshot_id and body.snapshot_id != body.snapshot_ids[0]:
+            raise HTTPException(422, "The primary snapshot must be the first selected frame")
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable answers")
@@ -488,17 +511,32 @@ async def ask(session_id: str, body: Question):
         decks = [available_by_id[deck_id] for deck_id in selected_ids]
         slides_by_deck = {deck["id"]: db.execute("SELECT * FROM deck_slides WHERE deck_id=? ORDER BY slide_number",
                                                  (deck["id"],)).fetchall() for deck in decks}
-        if body.snapshot_id:
+        if body.snapshot_ids is not None:
+            selected_shots = [db.execute("SELECT * FROM snapshots WHERE id=? AND session_id=?", (ident, session_id)).fetchone()
+                              for ident in body.snapshot_ids]
+            if any(item is None for item in selected_shots):
+                raise HTTPException(422, "A selected frame does not belong to this session")
+            shot = selected_shots[0]
+        elif body.snapshot_id:
             shot = db.execute("SELECT * FROM snapshots WHERE id=? AND session_id=?", (body.snapshot_id, session_id)).fetchone()
         else:
             shot = db.execute("SELECT * FROM snapshots WHERE session_id=? ORDER BY captured_at_ms DESC LIMIT 1", (session_id,)).fetchone()
         if not shot:
             raise HTTPException(409, "No snapshots yet. Start camera capture first")
-        recent_shots = db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
-                                  (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
+        if body.snapshot_ids is None:
+            selected_shots = [shot]
+            recent_shots = db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
+                                      (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
+        else:
+            recent_shots = []
         previous = db.execute("SELECT question, answer_json FROM messages WHERE session_id=? AND chat_id=? ORDER BY created_at_ms DESC LIMIT 8", (session_id, chat_id)).fetchall()
-        segments = db.execute("SELECT * FROM segments WHERE session_id=? AND start_ms<=? AND end_ms>=? ORDER BY start_ms LIMIT 8",
-                              (session_id, shot["captured_at_ms"] + 15000, max(0, shot["captured_at_ms"] - 30000))).fetchall()
+        segment_by_id = {}
+        for selected_shot in selected_shots:
+            nearby = db.execute("SELECT * FROM segments WHERE session_id=? AND start_ms<=? AND end_ms>=? ORDER BY start_ms LIMIT 8",
+                                (session_id, selected_shot["captured_at_ms"] + 15000,
+                                 max(0, selected_shot["captured_at_ms"] - 30000))).fetchall()
+            segment_by_id.update({item["id"]: item for item in nearby})
+        segments = sorted(segment_by_id.values(), key=lambda item: item["start_ms"])
     if body.region and (body.region.x + body.region.width > 1.000001 or body.region.y + body.region.height > 1.000001):
         raise HTTPException(422, "Region extends outside image")
     image_bytes = Path(shot["path"]).read_bytes()
@@ -513,15 +551,18 @@ async def ask(session_id: str, body: Question):
             continue
         recent_conversation.append({"question": row["question"], "answer": prior_result.get("answer", "")})
     recent_conversation = recent_conversation[-4:]
-    parts = [{"text": "You are LectureLens, a classroom visual companion. Answer the student's question in the requested language. Use the supplied board image as visual evidence. Preserve mathematical symbols exactly; if illegible, say so. Distinguish what is visible from what is inferred or stated by a transcript or lecture deck. Uploaded deck text is background context, not proof of what is visible in the camera image. Deck extraction omits images and diagrams; do not claim to see them. Use slide text only when relevant, and cite its exact slide_id in slide_references; otherwise return an empty list. Never treat nearby timestamps or slide similarity as proof of a visual reference. Do not invent details. Within JSON string fields, use Markdown for lists and emphasis, $...$ for inline LaTeX equations, $$...$$ for display equations, and backticks for literal code or pseudocode. Do not wrap mathematical notation in code backticks. Return concise JSON with answer, visible_evidence (array of short strings), inferred_explanation (array of short strings), uncertainties (array of short strings), transcript_segment_ids (array of IDs actually used), slide_references (array of exact slide IDs actually used), and status (supported, partial, or unsupported).\n" +
+    parts = [{"text": "You are LectureLens, a classroom visual companion. Answer the student's question in the requested language. Use the supplied board images as visual evidence. Each selected frame has a label F1, F2, etc.; distinguish which frame supports each observation, especially when describing changes across frames. F1 is the primary frame, and any selected region R1 belongs only to F1. The frames may not be consecutive; do not invent what happened between them. Preserve mathematical symbols exactly; if illegible, say so. Distinguish what is visible from what is inferred or stated by a transcript or lecture deck. Uploaded deck text is background context, not proof of what is visible in the camera image. Deck extraction omits images and diagrams; do not claim to see them. Use slide text only when relevant, and cite its exact slide_id in slide_references; otherwise return an empty list. Never treat nearby timestamps or slide similarity as proof of a visual reference. Do not invent details. Within JSON string fields, use Markdown for lists and emphasis, $...$ for inline LaTeX equations, $$...$$ for display equations, and backticks for literal code or pseudocode. Do not wrap mathematical notation in code backticks. Return concise JSON with answer, visible_evidence (array of short strings), inferred_explanation (array of short strings), uncertainties (array of short strings), transcript_segment_ids (array of IDs actually used), slide_references (array of exact slide IDs actually used), and status (supported, partial, or unsupported).\n" +
              json.dumps({"question": body.question, "language": body.language,
                          "region_label": "R1" if body.region else None,
                          "region_bbox_normalized": body.region.model_dump() if body.region else None,
-                         "snapshot_at_ms": shot["captured_at_ms"],
+                         "selected_frames": [{"label": f"F{index}", "snapshot_id": item["id"], "captured_at_ms": item["captured_at_ms"]}
+                                             for index, item in enumerate(selected_shots, 1)],
                          "transcript": [dict(s) for s in segments],
                          "lecture_deck": slides_context,
-                         "recent_conversation": recent_conversation}, ensure_ascii=False)},
-             image_part(image_bytes)]
+                         "recent_conversation": recent_conversation}, ensure_ascii=False)}]
+    for index, selected_shot in enumerate(selected_shots, 1):
+        parts.append({"text": f"Selected frame F{index} at {selected_shot['captured_at_ms']} ms:"})
+        parts.append(image_part(image_bytes if index == 1 else Path(selected_shot["path"]).read_bytes()))
     for older in reversed(recent_shots):
         parts.append({"text": f"Earlier snapshot at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
         parts.append(image_part(Path(older["path"]).read_bytes()))
@@ -570,8 +611,9 @@ async def ask(session_id: str, body: Question):
         else:
             db.execute("UPDATE chats SET title=? WHERE id=? AND title='New chat'", (body.question[:64], chat_id))
         ident = new_id("msg")
-        db.execute("INSERT INTO messages (id,session_id,snapshot_id,region_json,question,answer_json,created_at_ms,chat_id) VALUES (?,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO messages (id,session_id,snapshot_id,region_json,question,answer_json,created_at_ms,chat_id,snapshot_ids_json) VALUES (?,?,?,?,?,?,?,?,?)",
                    (ident, session_id, shot["id"], body.region.model_dump_json() if body.region else None,
-                    body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000), chat_id))
+                    body.question, json.dumps(result, ensure_ascii=False), int(time.time()*1000), chat_id,
+                    json.dumps([item["id"] for item in selected_shots])))
         row = db.execute("SELECT * FROM messages WHERE id=?", (ident,)).fetchone()
     return message_public(row)
