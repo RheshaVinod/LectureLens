@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+.DS_Store
+build/
+build-release/
+ios/Pods/
+ios/build/
+ios/*.xcuserstate
+ios/**/*.xcuserstate

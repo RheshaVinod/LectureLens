@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "LectureLens",
+    "slug": "lecturelens",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "lecturelens",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "LectureLens uses your camera to capture lecture boards and slides.",
+        "NSMicrophoneUsageDescription": "LectureLens uses your microphone for live lecture captions.",
+        "NSSpeechRecognitionUsageDescription": "LectureLens transcribes the lecture so you can review it later."
+      },
+      "bundleIdentifier": "com.anonymous.lecturelens-mobile"
+    },
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#28463c"
+      }
+    },
+    "plugins": [
+      "expo-camera",
+      "expo-document-picker",
+      "expo-image-picker",
+      [
+        "@react-native-voice/voice",
+        {
+          "microphonePermission": "LectureLens uses your microphone for live lecture captions."
+        }
+      ],
+      "expo-font",
+      "expo-asset"
+    ],
+    "extra": {
+      "apiBaseUrl": "https://lecturelens-2pfp.onrender.com",
+      "eas": {
+        "projectId": "1c7dab88-971e-4257-b775-f9863aba682d"
+      }
+    },
+    "owner": "jvkirans-team"
+  }
+}
