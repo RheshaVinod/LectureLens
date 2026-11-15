@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = {sessionId:null,sessionStartedEpochMs:null,serverClockOffsetMs:0,stream:null,timer:null,snapshots:[],selected:null,selectedFrames:[],multiFrame:false,region:null,selecting:false,pinned:false,busy:false,captureInFlight:false,lastCaptureAt:0,messages:[],allMessages:[],chats:[],classes:[],decks:[],uploadingDeck:false,deckUploadProgress:'',deckError:null,activeChatId:null,activeClassId:null,chatSelectionReady:false,deletingChatId:null,suppressStageClick:false,viewerZoom:1,viewerSelecting:false};
+const state = {sessionId:null,sessionStartedEpochMs:null,serverClockOffsetMs:0,stream:null,timer:null,recordingTimer:null,recordingStartedAt:null,snapshots:[],selected:null,selectedFrames:[],multiFrame:false,region:null,selecting:false,pinned:false,busy:false,captureInFlight:false,lastCaptureAt:0,messages:[],allMessages:[],chats:[],classes:[],decks:[],uploadingDeck:false,deckUploadProgress:'',deckError:null,activeChatId:null,activeClassId:null,chatSelectionReady:false,deletingChatId:null,suppressStageClick:false,viewerZoom:1,viewerSelecting:false};
 const voiceQuestionState = {recognition:null,starting:false,stopping:false,base:'',resumeCaptions:false,error:null};
 const voiceLanguages = {en:'en-US',es:'es-ES',fr:'fr-FR',zh:'zh-CN',hi:'hi-IN',ko:'ko-KR',ja:'ja-JP',de:'de-DE',pt:'pt-BR',ar:'ar-SA'};
 const readAloudState = {source:null,context:null,controller:null,messageId:null,resumeCaptions:false,starting:false,captionPause:null,request:0};
@@ -312,7 +312,27 @@ async function capture(reason='timer'){
     status(`${reason==='caption'?'Caption-linked snapshot':'Capturing'} · ${elapsed(shot.captured_at_ms)}`)
   }catch(e){status(e.message,true)}finally{state.captureInFlight=false}
 }
-function stop(){clearInterval(state.timer);state.timer=null;state.stream?.getTracks().forEach(t=>{t.onended=null;t.stop()});state.stream=null;$('startCamera').disabled=false;$('stopCamera').disabled=true;status('Camera off');showMedia()}
+function updateRecordingButton(){
+  if(!state.recordingStartedAt)return;
+  $('startCamera').innerHTML=`<span class="recording-dot">●</span> Live ${elapsed(Date.now()-state.recordingStartedAt)}`;
+}
+function startRecordingIndicator(){
+  if(state.recordingTimer)return;
+  state.recordingStartedAt=Date.now();updateRecordingButton();state.recordingTimer=setInterval(updateRecordingButton,1000);
+  $('startCamera').classList.add('recording');$('startCamera').disabled=true;$('stopCamera').disabled=false;
+}
+function stopRecordingIndicator(){
+  clearInterval(state.recordingTimer);state.recordingTimer=null;state.recordingStartedAt=null;
+  $('startCamera').classList.remove('recording');$('startCamera').innerHTML='Start lecture <span>↗</span>';
+  $('startCamera').disabled=false;$('stopCamera').disabled=true;
+}
+function setTranscriptCollapsed(collapsed){
+  document.querySelector('.audio-card').classList.toggle('transcript-collapsed',collapsed);
+  $('transcriptToggle').textContent=collapsed?'Show transcript':'Hide transcript';
+  $('transcriptToggle').setAttribute('aria-expanded',String(!collapsed));
+  localStorage.setItem('lecturelens-transcript-collapsed',String(collapsed));
+}
+function stop(){clearInterval(state.timer);state.timer=null;state.stream?.getTracks().forEach(t=>{t.onended=null;t.stop()});state.stream=null;status('Camera off');showMedia()}
 async function start(){
   if(!window.isSecureContext){status(`Camera blocked: ${location.origin} is not a secure context. Open localhost on this device or use HTTPS.`,true);return}
   if(!navigator.mediaDevices?.getUserMedia){status(`Camera API unavailable at ${location.origin}. Check Chrome camera permissions and whether this page is inside another app.`,true);return}
@@ -333,10 +353,13 @@ async function start(){
 async function startCombined(){
   $('startCamera').disabled=true;status('Requesting camera and microphone permission…');
   await Promise.all([start(),window.LectureLensAudio?.start?.()]);
-  if(state.stream&&window.LectureLensAudio?.isListening?.())status('Audio + video live · snapshots every 4 seconds');
+  const listening=window.LectureLensAudio?.isListening?.();
+  if(state.stream||listening)startRecordingIndicator();else stopRecordingIndicator();
+  if(state.stream&&listening)status('Audio + video live · snapshots every 4 seconds');
   else if(state.stream)status('Video live · microphone captions are not active',true);
+  else if(listening)status('Audio live · camera is unavailable',true);
 }
-function stopCombined(){stop();void window.LectureLensAudio?.stop?.();status('Audio + video capture stopped')}
+function stopCombined(){stop();void window.LectureLensAudio?.stop?.();stopRecordingIndicator();status('Lecture capture stopped')}
 function imagePoint(event){
   const box=$('stage').getBoundingClientRect(), shot=state.selected;
   const ratio=shot.width_px/shot.height_px,view=box.width/box.height;
@@ -687,6 +710,8 @@ async function ask(question,snapshotId=null,regionOverride=undefined,deckIdsOver
 }
 async function init(){const params=new URLSearchParams(location.search);state.sessionId=params.get('session');
   applyTheme(document.documentElement.dataset.theme==='dark'?'dark':'light');
+  setTranscriptCollapsed(localStorage.getItem('lecturelens-transcript-collapsed')==='true');
+  $('transcriptToggle').onclick=()=>setTranscriptCollapsed(!document.querySelector('.audio-card').classList.contains('transcript-collapsed'));
   $('themeToggle').onclick=()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';applyTheme(theme);localStorage.setItem('lecturelens-theme',theme)};
   try{if(state.sessionId)await refresh();else{const result=await api('/api/sessions',{method:'POST'});state.sessionId=result.session_id;history.replaceState({},'',`?session=${state.sessionId}`);await refresh()}
     if(!state.chats.length)await createChat();
@@ -696,10 +721,11 @@ async function init(){const params=new URLSearchParams(location.search);state.se
   $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;
   $('connectPhone').onclick=openPhoneJoin;
   $('copyPhoneLink').onclick=async()=>{await navigator.clipboard.writeText($('phoneLink').href);$('copyPhoneLink').firstChild.textContent='Copied '};
-  $('uploadSlides').onclick=()=>$('slideFiles').click();
+  $('uploadSlides').onclick=()=>{$('uploadMenu').open=false;$('slideFiles').click()};
   $('slideFiles').onchange=()=>uploadSlides([...$('slideFiles').files]);
-  $('uploadDeck').onclick=()=>$('slideFile').click();
+  $('uploadDeck').onclick=()=>{$('uploadMenu').open=false;$('slideFile').click()};
   $('slideFile').onchange=()=>uploadDeck([...$('slideFile').files]);
+  document.addEventListener('click',event=>{if($('uploadMenu').open&&!$('uploadMenu').contains(event.target))$('uploadMenu').open=false});
   window.addEventListener('lecturelens:transcript',()=>{if(state.stream&&Date.now()-state.lastCaptureAt>=2000)void capture('caption')});
   window.addEventListener('lecturelens:translation-language',event=>{const language=event.detail?.language;if(language&&[...$('language').options].some(option=>option.value===language))$('language').value=language});
   $('useDeck').onchange=()=>{localStorage.setItem(deckKey('use-deck'),String($('useDeck').checked));state.deckError=null;renderDeckStatus()};
