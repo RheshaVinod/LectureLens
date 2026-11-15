@@ -70,7 +70,8 @@ class MaterialUploadTest(unittest.TestCase):
                 answer = {"answer": "The current frame is visible [[F1]].", "visible_evidence": ["Board image"],
                           "inferred_explanation": [], "uncertainties": [], "transcript_segment_ids": [],
                           "slide_references": [], "citations": ["F1"], "status": "supported"}
-                return {"candidates": [{"content": {"parts": [{"text": json.dumps(answer)}]}}]}
+                return {"status": "completed", "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": json.dumps(answer)}]}]}
 
         class FakeClient:
             def __init__(self, **kwargs):
@@ -86,7 +87,7 @@ class MaterialUploadTest(unittest.TestCase):
                 payloads.append(kwargs["json"])
                 return FakeResponse()
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
             response = self.client.post(f"/api/sessions/{self.session_id}/ask",
                                         json={"chat_id": chat["chat_id"], "question": "What is shown?",
                                               "snapshot_id": new_frame, "selected_deck_ids": []})
@@ -132,7 +133,8 @@ class MaterialUploadTest(unittest.TestCase):
                           "inferred_explanation": [], "uncertainties": [], "transcript_segment_ids": [],
                           "slide_references": [f"{diagram['deck_id']}:1"],
                           "citations": [*self.labels, "M999"], "status": "partial"}
-                return {"candidates": [{"content": {"parts": [{"text": json.dumps(result)}]}}]}
+                return {"status": "completed", "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": json.dumps(result)}]}]}
 
         class FakeClient:
             def __init__(self, **kwargs):
@@ -147,21 +149,21 @@ class MaterialUploadTest(unittest.TestCase):
             async def post(self, url, **kwargs):
                 payload = kwargs["json"]
                 captured.append(payload)
-                context = json.loads(payload["contents"][0]["parts"][0]["text"].split("\n", 1)[1])
+                context = json.loads(payload["input"][0]["content"][0]["text"].split("\n", 1)[1])
                 labels = [next(item["label"] for item in context["source_catalog"] if item["id"] == source_id)
                           for source_id in (f"{pdf['deck_id']}:6", f"{diagram['deck_id']}:1")]
                 return FakeResponse(labels)
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
             response = self.client.post(f"/api/sessions/{self.session_id}/ask",
                                         json={"question": "Explain the banana theorem optimization diagram", "selected_deck_ids":
                                               [word["deck_id"], pdf["deck_id"], diagram["deck_id"], notes["deck_id"]]})
         self.assertEqual(response.status_code, 200, response.text)
-        parts = captured[0]["contents"][0]["parts"]
+        parts = captured[0]["input"][0]["content"]
         context = parts[0]["text"]
         self.assertIn("Gradient descent updates weights", context)
         self.assertIn("loss is minimized iteratively", context)
-        self.assertEqual(sum("inlineData" in part for part in parts), 4)
+        self.assertEqual(sum(part["type"] == "input_image" for part in parts), 4)
         self.assertEqual(response.json()["result"]["slide_references"], ["diagram.png · image 1"])
         sources = response.json()["result"]["sources"]
         self.assertEqual(len(sources), 2)
@@ -186,6 +188,7 @@ class MaterialUploadTest(unittest.TestCase):
         caption = self.client.post(f"/api/sessions/{self.session_id}/transcript",
                                    json={"start_ms": 0, "end_ms": 5000, "speaker": "lecturer",
                                          "language": "en", "text": "The limit approaches zero."}).json()
+        requests = []
 
         class FakeResponse:
             def raise_for_status(self):
@@ -197,7 +200,8 @@ class MaterialUploadTest(unittest.TestCase):
                           "uncertainties": [], "transcript_segment_ids": [caption["segment_id"]],
                           "slide_references": [f"{note['deck_id']}:1"],
                           "citations": ["F1", "A1", "M1", "F999"], "status": "supported"}
-                return {"candidates": [{"content": {"parts": [{"text": json.dumps(result)}]}}]}
+                return {"status": "completed", "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": json.dumps(result)}]}]}
 
         class FakeClient:
             def __init__(self, **kwargs):
@@ -210,14 +214,20 @@ class MaterialUploadTest(unittest.TestCase):
                 return None
 
             async def post(self, url, **kwargs):
+                requests.append((url, kwargs))
                 return FakeResponse()
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
             response = self.client.post(f"/api/sessions/{self.session_id}/ask",
                                         json={"question": "Why does the limit approach zero?",
                                               "snapshot_id": snapshot["snapshot_id"],
                                               "selected_deck_ids": [note["deck_id"]]})
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(requests[0][0], "https://api.openai.com/v1/responses")
+        self.assertEqual(requests[0][1]["headers"]["Authorization"], "Bearer test")
+        self.assertEqual(requests[0][1]["json"]["model"], lecture.MODEL)
+        self.assertEqual(requests[0][1]["json"]["text"]["format"]["schema"], lecture.ANSWER_SCHEMA)
+        self.assertTrue(any(part["type"] == "input_image" for part in requests[0][1]["json"]["input"][0]["content"]))
         result = response.json()["result"]
         self.assertEqual(result["citations"], ["F1", "A1", "M1"])
         self.assertEqual([source["kind"] for source in result["sources"]], ["frame", "transcript", "material"])

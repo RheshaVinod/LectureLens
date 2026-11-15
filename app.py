@@ -35,10 +35,9 @@ load_dotenv(ROOT / ".env")
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
 DB = DATA / "lecturelens.sqlite3"
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
-TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-3.8-flash-tts")
-TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Sulafat")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
 logger = logging.getLogger("lecturelens")
 MAX_UPLOAD = 8 * 1024 * 1024
 MAX_SLIDE_UPLOAD = 30 * 1024 * 1024
@@ -57,29 +56,30 @@ ANSWER_RESPONSE_SCHEMA = {
                  "transcript_segment_ids", "status"],
 }
 RECAP_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
+    "type": "object",
     "properties": {
-        "title": {"type": "STRING"},
-        "overview": {"type": "STRING"},
-        "key_concepts": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-            "concept": {"type": "STRING"}, "explanation": {"type": "STRING"},
-            "evidence_timestamps_ms": {"type": "ARRAY", "items": {"type": "INTEGER"}},
-        }, "required": ["concept", "explanation", "evidence_timestamps_ms"]}},
-        "important_visuals": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-            "snapshot_id": {"type": "STRING"}, "timestamp_ms": {"type": "INTEGER"},
-            "description": {"type": "STRING"},
-        }, "required": ["snapshot_id", "timestamp_ms", "description"]}},
-        "formulas_and_terms": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-            "item": {"type": "STRING"}, "explanation": {"type": "STRING"},
-        }, "required": ["item", "explanation"]}},
-        "review_questions": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
-            "question": {"type": "STRING"}, "answer": {"type": "STRING"},
-        }, "required": ["question", "answer"]}},
-        "unresolved_questions": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "next_steps": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "title": {"type": "string"},
+        "overview": {"type": "string"},
+        "key_concepts": {"type": "array", "items": {"type": "object", "properties": {
+            "concept": {"type": "string"}, "explanation": {"type": "string"},
+            "evidence_timestamps_ms": {"type": "array", "items": {"type": "integer"}},
+        }, "required": ["concept", "explanation", "evidence_timestamps_ms"], "additionalProperties": False}},
+        "important_visuals": {"type": "array", "items": {"type": "object", "properties": {
+            "snapshot_id": {"type": "string"}, "timestamp_ms": {"type": "integer"},
+            "description": {"type": "string"},
+        }, "required": ["snapshot_id", "timestamp_ms", "description"], "additionalProperties": False}},
+        "formulas_and_terms": {"type": "array", "items": {"type": "object", "properties": {
+            "item": {"type": "string"}, "explanation": {"type": "string"},
+        }, "required": ["item", "explanation"], "additionalProperties": False}},
+        "review_questions": {"type": "array", "items": {"type": "object", "properties": {
+            "question": {"type": "string"}, "answer": {"type": "string"},
+        }, "required": ["question", "answer"], "additionalProperties": False}},
+        "unresolved_questions": {"type": "array", "items": {"type": "string"}},
+        "next_steps": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["title", "overview", "key_concepts", "important_visuals",
                  "formulas_and_terms", "review_questions", "unresolved_questions", "next_steps"],
+    "additionalProperties": False,
 }
 MAX_DECK_UPLOAD = 20 * 1024 * 1024
 MAX_DECK_SLIDES = 100
@@ -850,53 +850,39 @@ async def answer_speech(session_id: str, message_id: str):
     text = answer_for_speech(json.loads(row["answer_json"]).get("answer", ""))
     if not text:
         raise HTTPException(422, "This answer has no readable text")
-    if len(text) > 12000:
+    if len(text) > 4096:
         raise HTTPException(413, "This answer is too long for read aloud")
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable read aloud")
-    payload = {"model": TTS_MODEL,
-               "input": [{"type": "user_input", "content": [{"type": "text", "text": text,
-                         "annotations": [{"type": "speech_metadata", "style": "warm, clear, conversational tutor"}]}]}],
-               "response_format": {"type": "audio"},
-               "generation_config": {"speech_config": [{"voice": TTS_VOICE}]}}
-    models = [TTS_MODEL]
-    if TTS_FALLBACK_MODEL and TTS_FALLBACK_MODEL != TTS_MODEL:
-        models.append(TTS_FALLBACK_MODEL)
-    audio = None
+        raise HTTPException(503, "Set OPENAI_API_KEY in .env and restart the server to enable read aloud")
+    payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE,
+               "instructions": "Speak warmly and naturally, like a patient tutor explaining a concept.",
+               "response_format": "wav"}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
-            for model in models:
-                payload["model"] = model
-                try:
-                    response = await client.post("https://generativelanguage.googleapis.com/v1beta/interactions",
-                                                 headers={"x-goog-api-key": key}, json=payload)
-                    response.raise_for_status()
-                    data = response.json()
-                    blocks = [content for step in data.get("steps", []) if step.get("type") == "model_output"
-                              for content in step.get("content", []) if content.get("type") == "audio"]
-                    audio = base64.b64decode(blocks[-1]["data"], validate=True)
-                    if len(audio) > 25 * 1024 * 1024 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
-                        raise ValueError("Invalid WAV audio")
-                    break
-                except httpx.HTTPStatusError as exc:
-                    logger.warning("TTS model=%s HTTP status=%s", model, exc.response.status_code)
-                    if exc.response.status_code not in (429, 500, 502, 503, 504) or model == models[-1]:
-                        raise HTTPException(502, model_error_detail(exc.response.status_code)) from exc
-                except (KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
-                    logger.warning("TTS model=%s response error=%s", model, type(exc).__name__)
-                    if model == models[-1]:
-                        raise HTTPException(502, "The voice service returned no playable audio. Try again.") from exc
+            response = await client.post("https://api.openai.com/v1/audio/speech",
+                                         headers={"Authorization": f"Bearer {key}"}, json=payload)
+        response.raise_for_status()
+        audio = response.content
+        if len(audio) > 25 * 1024 * 1024 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+            raise ValueError("Invalid WAV audio")
+    except httpx.HTTPStatusError as exc:
+        logger.warning("TTS model=%s HTTP status=%s", TTS_MODEL, exc.response.status_code)
+        raise HTTPException(502, model_error_detail(exc.response.status_code)) from exc
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "Voice generation took too long. Try again.") from exc
     except httpx.RequestError as exc:
         logger.warning("TTS network error: %s", type(exc).__name__)
         raise HTTPException(502, "Could not connect to the voice service. Try again.") from exc
+    except ValueError as exc:
+        logger.warning("TTS model=%s returned invalid audio", TTS_MODEL)
+        raise HTTPException(502, "The voice service returned no playable audio. Try again.") from exc
     return Response(audio, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})
 
 
 def image_part(data):
-    return {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(data).decode()}}
+    return {"type": "input_image", "image_url": "data:image/jpeg;base64," + base64.b64encode(data).decode(),
+            "detail": "high"}
 
 
 def nearby_segments(db, session_id, anchor_ms, limit=12):
@@ -992,34 +978,30 @@ ANSWER_SCHEMA = {
 }
 
 
-def parse_model_answer(response):
-    """Use the final text part; Gemini may include non-answer thought parts."""
+def parse_model_json(response):
     data = response.json()
-    candidate = data["candidates"][0]
-    texts = [part["text"] for part in candidate["content"]["parts"]
-             if isinstance(part.get("text"), str) and not part.get("thought")]
-    for content in reversed(texts):
-        try:
-            answer = json.loads(content)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(answer, dict) and isinstance(answer.get("answer"), str):
-            return answer
-    logger.warning("Unparseable model answer: finish_reason=%s text_parts=%s lengths=%s",
-                   candidate.get("finishReason"), len(texts), [len(t) for t in texts])
-    raise ValueError("Unparseable answer")
+    if data.get("status") != "completed":
+        raise ValueError("Incomplete model response")
+    content = [part.get("text", "") for item in data.get("output", []) if item.get("type") == "message"
+               for part in item.get("content", []) if part.get("type") == "output_text"]
+    if not content:
+        raise ValueError("Model returned no text")
+    result = json.loads("".join(content))
+    if not isinstance(result, dict):
+        raise ValueError("Model returned invalid JSON")
+    return result
 
 
 def model_error_detail(status_code):
     return {
         400: "The model rejected this request. Try a different capture; check the server log if it repeats.",
-        401: "The Gemini API key was rejected. Check GEMINI_API_KEY in .env and restart the server.",
-        403: "This API key cannot access the model. Check the key's project and model access.",
+        401: "The OpenAI API key was rejected. Check OPENAI_API_KEY in .env and restart the server.",
+        403: "This OpenAI API key cannot access the model. Check the key's project and model access.",
         413: "The captured images are too large for the model request. Try again with a different capture.",
-        429: "Gemini rate limit or quota reached. Wait and retry, or check your project's quota.",
-        500: "Gemini had a temporary server error. Retry this question.",
-        503: "Gemini is temporarily unavailable. Retry this question shortly.",
-    }.get(status_code, f"Gemini returned HTTP {status_code}. Retry this question or check the server log.")
+        429: "OpenAI rate limit or quota reached. Wait and retry, or check your project's quota.",
+        500: "OpenAI had a temporary server error. Retry this question.",
+        503: "OpenAI is temporarily unavailable. Retry this question shortly.",
+    }.get(status_code, f"OpenAI returned HTTP {status_code}. Retry this question or check the server log.")
 
 
 @app.post("/api/sessions/{session_id}/ask")
@@ -1029,9 +1011,9 @@ async def ask(session_id: str, body: Question):
             raise HTTPException(422, "Select 1 to 4 distinct frames")
         if body.snapshot_id and body.snapshot_id != body.snapshot_ids[0]:
             raise HTTPException(422, "The primary snapshot must be the first selected frame")
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable answers")
+        raise HTTPException(503, "Set OPENAI_API_KEY in .env and restart the server to enable answers")
     with conn() as db:
         current_session = session(db, session_id)
         if body.chat_id:
@@ -1153,7 +1135,7 @@ async def ask(session_id: str, body: Question):
             continue
         recent_conversation.append({"question": row["question"], "answer": prior_result.get("answer", "")})
     recent_conversation = recent_conversation[-4:]
-    parts = [{"text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. Use relevant evidence from the provided board frames (F), lecture captions (A), and uploaded material pages (M). Put citations like [[F1]], [[A2]], and [[M3]] directly after the claims they support in answer, and list those exact labels in citations. Cite only labels present in source_catalog. Do not cite a source merely because its timestamp is nearby; check its content. When no live frame is supplied, visible_evidence must be empty: uploaded material images are background context, not proof of what appeared live. F1 is the primary frame and region R1 belongs only to F1. If a region R1 is selected and an answer claim specifically describes that region, place [[R1]] immediately after that claim; otherwise do not use [[R1]]. R1 is a region link, not a source citation. Preserve mathematical notation; flag unreadable details. Distinguish observed content from explanation and unsupported inference. Only claim to see uploaded material images when visual_supplied is true. Include only relevant exact slide IDs in slide_references and actual used transcript IDs in transcript_segment_ids. Use Markdown inside JSON strings and LaTeX delimiters for equations. Return concise structured JSON.\n" +
+    parts = [{"type": "input_text", "text": "You are LectureLens, a classroom learning companion. Answer the student's question in the requested language. Use relevant evidence from the provided board frames (F), lecture captions (A), and uploaded material pages (M). Put citations like [[F1]], [[A2]], and [[M3]] directly after the claims they support in answer, and list those exact labels in citations. Cite only labels present in source_catalog. Do not cite a source merely because its timestamp is nearby; check its content. When no live frame is supplied, visible_evidence must be empty: uploaded material images are background context, not proof of what appeared live. F1 is the primary frame and region R1 belongs only to F1. If a region R1 is selected and an answer claim specifically describes that region, place [[R1]] immediately after that claim; otherwise do not use [[R1]]. R1 is a region link, not a source citation. Preserve mathematical notation; flag unreadable details. Distinguish observed content from explanation and unsupported inference. Only claim to see uploaded material images when visual_supplied is true. Include only relevant exact slide IDs in slide_references and actual used transcript IDs in transcript_segment_ids. Use Markdown inside JSON strings and LaTeX delimiters for equations. Return concise structured JSON.\n" +
              json.dumps({"question": body.question, "language": body.language,
                          "region_label": "R1" if body.region else None,
                          "region_bbox_normalized": body.region.model_dump() if body.region else None,
@@ -1166,14 +1148,14 @@ async def ask(session_id: str, body: Question):
                          "lecture_deck": slides_context,
                          "recent_conversation": recent_conversation}, ensure_ascii=False)}]
     for index, selected_shot in enumerate(selected_shots, 1):
-        parts.append({"text": f"Selected frame F{index} at {selected_shot['captured_at_ms']} ms:"})
+        parts.append({"type": "input_text", "text": f"Selected frame F{index} at {selected_shot['captured_at_ms']} ms:"})
         parts.append(image_part(image_bytes if index == 1 else Path(selected_shot["path"]).read_bytes()))
     for index, older in enumerate(reversed(recent_shots), len(selected_shots) + 1):
-        parts.append({"text": f"Earlier frame F{index} at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
+        parts.append({"type": "input_text", "text": f"Earlier frame F{index} at {older['captured_at_ms']} ms. Use for context only; describe changes cautiously:"})
         parts.append(image_part(Path(older["path"]).read_bytes()))
     for deck, slide, path in material_images:
         slide_id = f"{deck['id']}:{slide['slide_number']}"
-        parts.append({"text": f"Uploaded material {deck['filename']} · {material_labels[slide_id]}. This is background context, not a live camera frame:"})
+        parts.append({"type": "input_text", "text": f"Uploaded material {deck['filename']} · {material_labels[slide_id]}. This is background context, not a live camera frame:"})
         parts.append(image_part(path.read_bytes()))
     if body.region and image_bytes:
         im = Image.open(io.BytesIO(image_bytes))
@@ -1181,18 +1163,18 @@ async def ask(session_id: str, body: Question):
         box = (round(r.x * im.width), round(r.y * im.height), round((r.x+r.width)*im.width), round((r.y+r.height)*im.height))
         crop = io.BytesIO()
         im.crop(box).save(crop, "JPEG", quality=90)
-        parts.append({"text": "Selected region R1, enlarged:"})
+        parts.append({"type": "input_text", "text": "Selected region R1, enlarged:"})
         parts.append(image_part(crop.getvalue()))
-    payload = {"contents": [{"role": "user", "parts": parts}],
-               "generationConfig": {"responseMimeType": "application/json",
-                                    "responseJsonSchema": ANSWER_SCHEMA,
-                                    "maxOutputTokens": 4096}}
+    payload = {"model": MODEL, "input": [{"role": "user", "content": parts}], "store": False,
+               "text": {"format": {"type": "json_schema", "name": "lecture_answer",
+                                   "strict": True, "schema": ANSWER_SCHEMA}},
+               "max_output_tokens": 4096}
     try:
         async with httpx.AsyncClient(timeout=45) as client:
-            res = await client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-                                    headers={"x-goog-api-key": key}, json=payload)
+            res = await client.post("https://api.openai.com/v1/responses",
+                                    headers={"Authorization": f"Bearer {key}"}, json=payload)
         res.raise_for_status()
-        result = parse_model_answer(res)
+        result = parse_model_json(res)
     except httpx.HTTPStatusError as exc:
         logger.warning("Model HTTP status=%s", exc.response.status_code)
         raise HTTPException(502, model_error_detail(exc.response.status_code))
@@ -1314,9 +1296,9 @@ def recap_markdown(recap):
 
 @app.post("/api/sessions/{session_id}/recap")
 async def create_recap(session_id: str, body: RecapRequest):
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("OPENAI_API_KEY")
     if not key:
-        raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to generate a recap")
+        raise HTTPException(503, "Set OPENAI_API_KEY in .env and restart the server to generate a recap")
     with conn() as db:
         session(db, session_id)
         segments = db.execute("SELECT * FROM segments WHERE session_id=? ORDER BY start_ms",
@@ -1341,7 +1323,7 @@ async def create_recap(session_id: str, body: RecapRequest):
     qa_history = [{"question": row["question"],
                    "answer": json.loads(row["answer_json"]).get("answer", "")}
                   for row in messages[-40:]]
-    parts = [{"text": "Create a grounded study recap in the requested language from this lecture context. "
+    parts = [{"type": "input_text", "text": "Create a grounded study recap in the requested language from this lecture context. "
                       "Use only supplied evidence; do not invent topics, formulas, or definitions. Preserve "
                       "mathematical notation. Attach session-relative millisecond timestamps to key concepts. "
                       "Important visuals must use supplied snapshot IDs. Turn uncertainties and unanswered "
@@ -1353,22 +1335,25 @@ async def create_recap(session_id: str, body: RecapRequest):
         label = f"Representative {shot['source']} {shot['id']} at {shot['captured_at_ms']} ms"
         if shot["slide_number"]:
             label += f", slide {shot['slide_number']}"
-        parts.extend([{"text": label + ":"}, image_part(Path(shot["path"]).read_bytes())])
-    payload = {"contents": [{"role": "user", "parts": parts}],
-               "generationConfig": {"responseMimeType": "application/json",
-                                    "responseSchema": RECAP_RESPONSE_SCHEMA}}
+        parts.extend([{"type": "input_text", "text": label + ":"}, image_part(Path(shot["path"]).read_bytes())])
+    payload = {"model": MODEL, "input": [{"role": "user", "content": parts}], "store": False,
+               "text": {"format": {"type": "json_schema", "name": "lecture_recap",
+                                   "strict": True, "schema": RECAP_RESPONSE_SCHEMA}},
+               "max_output_tokens": 4096}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-                headers={"x-goog-api-key": key}, json=payload)
+            response = await client.post("https://api.openai.com/v1/responses",
+                                         headers={"Authorization": f"Bearer {key}"}, json=payload)
         response.raise_for_status()
-        content = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        recap = json.loads(content)
+        recap = parse_model_json(response)
         if not isinstance(recap.get("title"), str) or not isinstance(recap.get("overview"), str):
             raise ValueError("Invalid recap")
-    except (httpx.HTTPError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Recap generation failed: {type(exc).__name__}. Check server logs and model access")
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Recap model HTTP status=%s", exc.response.status_code)
+        raise HTTPException(502, model_error_detail(exc.response.status_code)) from exc
+    except (httpx.RequestError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        logger.warning("Recap model response error: %s", type(exc).__name__)
+        raise HTTPException(502, "Could not generate the recap. Try again or check the server log.") from exc
 
     valid_snapshot_ids = {row["id"] for row in snapshots}
     recap["important_visuals"] = [item for item in recap.get("important_visuals", [])

@@ -137,7 +137,7 @@ function renderRichText(element,text){
 function showMedia(){
   const live=!!state.stream && !state.pinned && !state.region && !state.selecting;
   $('video').classList.toggle('active',live);
-  $('snapshot').classList.toggle('active',!!state.selected);
+  $('snapshot').classList.toggle('active',!!state.selected&&!live);
   $('stageEmpty').hidden=!!state.stream||!!state.selected;
   $('stageBadge').textContent=live?'● LIVE CAMERA':state.selected?`SNAPSHOT · ${elapsed(state.selected.captured_at_ms)}`:state.stream?'● LIVE CAMERA':'Waiting for camera';
   $('selectRegion').disabled=!state.selected;
@@ -170,7 +170,7 @@ function renderMoments(){
   const visible=[...state.selectedFrames,...(state.selected?[state.selected]:[]),...shots]
     .filter((shot,index,items)=>items.findIndex(item=>item.snapshot_id===shot.snapshot_id)===index);
   $('momentCount').textContent=`${visible.length} recent snapshot${visible.length===1?'':'s'}`;
-  $('multiFrameToggle').disabled=!state.selected;
+  $('multiFrameToggle').disabled=!visible.length;
   $('multiFrameToggle').setAttribute('aria-pressed',String(state.multiFrame));
   $('multiFrameToggle').textContent=state.multiFrame?'Clear frames':'Select frames';
   if(!visible.length){const p=document.createElement('div');p.className='moment-placeholder';p.textContent='New captures will appear here.';target.append(p);return}
@@ -207,7 +207,11 @@ function toggleFrame(shot){
   showMedia();renderMoments();
 }
 function startFrameSelection(){
-  if(!state.selected)return;
+  if(!state.selected){
+    const latest=chatSnapshots()[0];
+    if(!latest)return;
+    selectSnapshot(latest,true);
+  }
   if(state.multiFrame){state.multiFrame=false;state.selectedFrames=[]}
   else{state.multiFrame=true;state.selectedFrames=[state.selected];state.pinned=true}
   showMedia();renderMoments();
@@ -407,7 +411,7 @@ async function start(){
   if(!navigator.mediaDevices?.getUserMedia){status(`Camera API unavailable at ${location.origin}. Check Chrome camera permissions and whether this page is inside another app.`,true);return}
   $('startCamera').disabled=true;status('Requesting camera permission…');
   try{const stream=await navigator.mediaDevices.getUserMedia(cameraConstraints());
-    await attachCameraStream(stream);$('startCamera').disabled=true;$('stopCamera').disabled=false;
+    await attachCameraStream(stream);clearChatVisualContext();$('startCamera').disabled=true;$('stopCamera').disabled=false;
     status('Capturing every 4 seconds');showMedia();await capture('start');state.timer=setInterval(()=>void capture('timer'),4000)
   }catch(e){
     state.stream?.getTracks().forEach(track=>track.stop());state.stream=null;$('startCamera').disabled=false;
@@ -762,7 +766,7 @@ async function ask(question,snapshotId=null,regionOverride=undefined,deckIdsOver
   const frameIds=frameIdsOverride===undefined?(state.multiFrame?state.selectedFrames.map(item=>item.snapshot_id):null):frameIdsOverride;
   const shot=snapshotId?{snapshot_id:snapshotId}:state.multiFrame?state.selectedFrames[0]:state.selected||null;
   const region=shot?(regionOverride===undefined?state.region:regionOverride):null;
-  const answerLanguage=$('captionLanguage')?.value||$('language').value;
+  const answerLanguage=$('language').value;
   const askedAtMs=Math.max(0,Date.now()+state.serverClockOffsetMs-(state.sessionStartedEpochMs||Date.now()));
   const root=$('conversation');if(!state.messages.length)root.replaceChildren();
   const pending=showQuestionState(question,frameIds?.length>1?`Looking at ${frameIds.length} selected frames${deckIds.length?' and files':''}…`:shot?(deckIds.length?'Looking at the selected capture and files…':'Looking at the selected capture…'):deckIds.length?'Reading selected files and transcript…':'Listening to the recent transcript…');

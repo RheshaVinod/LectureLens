@@ -42,7 +42,8 @@ class FakeResponse:
         return None
 
     def json(self):
-        return {"candidates": [{"content": {"parts": [{"text": json.dumps(SAMPLE_RECAP)}]}}]}
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps(SAMPLE_RECAP)}]}]}
 
 
 class FakeAsyncClient:
@@ -61,7 +62,8 @@ class FakeAsyncClient:
 
 class FakeAskResponse(FakeResponse):
     def json(self):
-        return {"candidates": [{"content": {"parts": [{"text": json.dumps(SAMPLE_ANSWER)}]}}]}
+        return {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps(SAMPLE_ANSWER)}]}]}
 
 
 class FakeAskAsyncClient(FakeAsyncClient):
@@ -71,6 +73,8 @@ class FakeAskAsyncClient(FakeAsyncClient):
 
 class RecapApiTest(unittest.TestCase):
     def setUp(self):
+        self.key_patch = patch.dict("os.environ", {"OPENAI_API_KEY": "test"})
+        self.key_patch.start()
         self.session_id = f"sess_test_{uuid.uuid4().hex}"
         with lecture_app.conn() as db:
             db.execute("INSERT INTO sessions (id, started_epoch_ms) VALUES (?,?)",
@@ -84,6 +88,7 @@ class RecapApiTest(unittest.TestCase):
         self.client = TestClient(lecture_app.app)
 
     def tearDown(self):
+        self.key_patch.stop()
         with lecture_app.conn() as db:
             snapshot_paths = [row["path"] for row in db.execute(
                 "SELECT path FROM snapshots WHERE session_id=?", (self.session_id,)).fetchall()]
