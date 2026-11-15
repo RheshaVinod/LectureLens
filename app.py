@@ -1033,14 +1033,14 @@ async def ask(session_id: str, body: Question):
     if not key:
         raise HTTPException(503, "Set GEMINI_API_KEY in server secrets to enable answers")
     with conn() as db:
-        session(db, session_id)
+        current_session = session(db, session_id)
         if body.chat_id:
-            chat = db.execute("SELECT id, class_id FROM chats WHERE id=? AND session_id=?", (body.chat_id, session_id)).fetchone()
+            chat = db.execute("SELECT id, class_id, created_at_ms FROM chats WHERE id=? AND session_id=?", (body.chat_id, session_id)).fetchone()
             if not chat:
                 raise HTTPException(404, "Chat not found in this session")
             chat_id = chat["id"]
         else:
-            chat = db.execute("SELECT id, class_id FROM chats WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone()
+            chat = db.execute("SELECT id, class_id, created_at_ms FROM chats WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone()
             chat_id = chat["id"] if chat else None
         class_row = ({"id": chat["class_id"]} if chat else db.execute(
             "SELECT id FROM classes WHERE session_id=? ORDER BY created_at_ms LIMIT 1", (session_id,)).fetchone())
@@ -1077,8 +1077,10 @@ async def ask(session_id: str, body: Question):
         else:
             shot = None
             selected_shots = []
-        recent_shots = (db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
-                                   (session_id, shot["captured_at_ms"], shot["id"])).fetchall()
+        chat_start_ms = max(0, chat["created_at_ms"] - current_session["started_epoch_ms"]) if chat else 0
+        recent_start_ms = 0 if shot and shot["captured_at_ms"] <= chat_start_ms else chat_start_ms
+        recent_shots = (db.execute("SELECT * FROM snapshots WHERE session_id=? AND captured_at_ms<=? AND captured_at_ms>? AND id!=? ORDER BY captured_at_ms DESC LIMIT 2",
+                                   (session_id, shot["captured_at_ms"], recent_start_ms, shot["id"])).fetchall()
                         if shot and len(selected_shots) == 1 else [])
         previous = db.execute(
             "SELECT question, answer_json FROM messages WHERE session_id=? AND (? IS NULL OR chat_id=?) ORDER BY created_at_ms DESC LIMIT 8",

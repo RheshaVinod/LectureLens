@@ -42,6 +42,58 @@ class MaterialUploadTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def test_new_chat_does_not_implicitly_include_earlier_frames(self):
+        picture = io.BytesIO()
+        Image.new("RGB", (640, 360), "white").save(picture, "JPEG")
+        def add_frame():
+            response = self.client.post(f"/api/sessions/{self.session_id}/snapshots",
+                                        files={"image": ("board.jpg", picture.getvalue(), "image/jpeg")})
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["snapshot_id"]
+
+        old_frame = add_frame()
+        chat = self.client.post(f"/api/sessions/{self.session_id}/chats",
+                                json={"class_id": self.class_id}).json()
+        new_frame = add_frame()
+        with lecture.conn() as db:
+            started = db.execute("SELECT started_epoch_ms FROM sessions WHERE id=?", (self.session_id,)).fetchone()[0]
+            db.execute("UPDATE chats SET created_at_ms=? WHERE id=?", (started + 200, chat["chat_id"]))
+            db.execute("UPDATE snapshots SET captured_at_ms=100 WHERE id=?", (old_frame,))
+            db.execute("UPDATE snapshots SET captured_at_ms=300 WHERE id=?", (new_frame,))
+        payloads = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                answer = {"answer": "The current frame is visible [[F1]].", "visible_evidence": ["Board image"],
+                          "inferred_explanation": [], "uncertainties": [], "transcript_segment_ids": [],
+                          "slide_references": [], "citations": ["F1"], "status": "supported"}
+                return {"candidates": [{"content": {"parts": [{"text": json.dumps(answer)}]}}]}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, **kwargs):
+                payloads.append(kwargs["json"])
+                return FakeResponse()
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), patch.object(lecture.httpx, "AsyncClient", FakeClient):
+            response = self.client.post(f"/api/sessions/{self.session_id}/ask",
+                                        json={"chat_id": chat["chat_id"], "question": "What is shown?",
+                                              "snapshot_id": new_frame, "selected_deck_ids": []})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(old_frame, json.dumps(payloads[0]))
+        self.assertEqual(response.json()["result"]["citations"], ["F1"])
+
     def test_document_pdf_image_and_file_only_question(self):
         document = io.BytesIO()
         with zipfile.ZipFile(document, "w") as archive:
