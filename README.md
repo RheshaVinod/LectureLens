@@ -7,7 +7,7 @@ LectureLens captures microphone audio and board images on one shared session clo
 1. Create a Python environment and install `requirements.txt`.
 2. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey). For local development, create a `.env` file next to `app.py` containing `GEMINI_API_KEY=your_key_here`. The app loads it at startup. In Replit, add `GEMINI_API_KEY` as a server-side secret instead. Do not put it in frontend code or commit it.
 3. Run `uvicorn app:app --host 0.0.0.0 --port 8000` and open the HTTPS Replit URL (or `http://localhost:8000`).
-4. Allow microphone access and start captions. For visuals, use the laptop camera, upload slides, or choose **Connect phone** and scan the QR code to take board photos with the phone's rear camera.
+4. Allow microphone and camera access, choose any detected built-in or external webcam from the **Camera** menu, and start the lecture. You can also upload slides or choose **Connect phone** and scan the QR code to take board photos with the phone's rear camera.
 
 To ask by voice in Chrome, tap the microphone in the question box, speak, then tap it again to finish. Review or edit the recognized text and press **Ask**. The current frame is pinned when dictation starts. If live captions are running, they pause during the question and resume afterward so the student's words are not stored as lecturer transcript. Voice dictation uses Chrome speech recognition and needs microphone permission on localhost or HTTPS.
 

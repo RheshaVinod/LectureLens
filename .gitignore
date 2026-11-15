@@ -4,3 +4,7 @@ __pycache__/
 data/
 *.pyc
 .firecrawl/
+.DS_Store
+.deck-build/
+.deck-finalizer/
+tmp/

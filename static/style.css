@@ -173,6 +173,14 @@
 @media(max-width:950px){.chat-sidebar,.sidebar-collapsed .chat-sidebar{width:270px}.sidebar-collapsed .chat-sidebar{width:52px}.app-main{margin-left:52px}}
 body:not(.chat-active) .visual-head .brand{font-size:21px}
 
+/* Camera source picker: names become available after browser permission is granted. */
+.camera-picker{display:flex;align-items:center;gap:7px;min-width:0;padding:5px 7px 5px 10px;border:1px solid #d8dcda;border-radius:4px;background:#fff;color:#737a77;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.camera-picker select{max-width:190px;min-width:120px;border:0;background:transparent;color:#373e40;font-size:11px;font-weight:500;letter-spacing:0;text-transform:none;outline:0}
+.camera-picker:focus-within{outline:2px solid var(--usc-gold);outline-offset:2px}
+.camera-picker select:disabled{opacity:.55}
+@media(min-width:761px){body:not(.chat-active) .camera-picker{padding:4px 6px 4px 8px}body:not(.chat-active) .camera-picker select{max-width:160px;font-size:10px}}
+@media(max-width:560px){.camera-picker{width:100%;justify-content:space-between}.camera-picker select{max-width:calc(100% - 62px);flex:1}}
+
 /* USC Cardinal and Gold on a light, readable workspace. */
 :root{--accent:#990000;--usc-gold:#ffcc00;--accent-soft:#fff9e8;--accent-border:#efdc9a}
 button:focus-visible,textarea:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--usc-gold);outline-offset:2px}
@@ -425,8 +433,6 @@ body:not(.chat-active) .question-head{margin:6px 0 13px}
 .read-aloud-button svg{width:15px;height:15px}
 .read-aloud-button:hover,.read-aloud-button.is-reading{background:var(--accent-soft);color:var(--accent)}
 .read-aloud-button:disabled{opacity:.45;cursor:not-allowed}
-.read-aloud-feedback{color:#a34534;font-size:11px;line-height:1.3}
-[data-theme="dark"] .read-aloud-feedback{color:#ffaaa1}
 .read-aloud-feedback{color:#a34534;font-size:11px;line-height:1.3}
 [data-theme="dark"] .read-aloud-feedback{color:#ffaaa1}
 

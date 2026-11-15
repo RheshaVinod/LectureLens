@@ -5,6 +5,46 @@ const voiceLanguages = {en:'en-US',es:'es-ES',fr:'fr-FR',zh:'zh-CN',hi:'hi-IN',k
 const readAloudState = {source:null,context:null,controller:null,messageId:null,resumeCaptions:false,starting:false,captionPause:null,request:0};
 const readAloudCache = new Map();
 
+function cameraConstraints(deviceId=$('camera')?.value){
+  return {audio:false,video:{...(deviceId?{deviceId:{exact:deviceId}}:{facingMode:{ideal:'environment'}}),width:{ideal:1280},height:{ideal:720}}};
+}
+async function refreshCameras(){
+  const select=$('camera');
+  if(!select||!navigator.mediaDevices?.enumerateDevices)return;
+  const selected=select.value||localStorage.getItem('lecturelens-camera-device')||'';
+  try{
+    const devices=(await navigator.mediaDevices.enumerateDevices()).filter(device=>device.kind==='videoinput');
+    select.replaceChildren(new Option('System default',''));
+    devices.forEach((device,index)=>select.add(new Option(device.label||`Camera ${index+1}`,device.deviceId)));
+    select.value=[...select.options].some(option=>option.value===selected)?selected:'';
+    select.disabled=!devices.length;
+  }catch{select.disabled=false}
+}
+async function attachCameraStream(stream){
+  const previous=state.stream;
+  state.stream=stream;
+  const video=$('video');video.srcObject=stream;await video.play();
+  stream.getVideoTracks()[0].onended=stopCombined;
+  previous?.getTracks().forEach(track=>{track.onended=null;track.stop()});
+  await refreshCameras();
+  const selected=$('camera').value;if(selected)localStorage.setItem('lecturelens-camera-device',selected);else localStorage.removeItem('lecturelens-camera-device');
+  showMedia();
+}
+async function switchCamera(){
+  const selected=$('camera').value;
+  if(selected)localStorage.setItem('lecturelens-camera-device',selected);else localStorage.removeItem('lecturelens-camera-device');
+  if(!state.stream)return;
+  $('camera').disabled=true;status('Switching camera…');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia(cameraConstraints(selected));
+    await attachCameraStream(stream);await capture('timer');status('Camera switched · audio remains live');
+  }catch(error){
+    await refreshCameras();
+    const detail=error.name==='NotReadableError'?'That camera is busy in another app.':`Could not switch camera: ${error.message}`;
+    status(detail,true);
+  }finally{$('camera').disabled=false}
+}
+
 function applyTheme(theme){
   document.documentElement.dataset.theme=theme;
   const button=$('themeToggle');
@@ -339,9 +379,8 @@ async function start(){
   if(!window.isSecureContext){status(`Camera blocked: ${location.origin} is not a secure context. Open localhost on this device or use HTTPS.`,true);return}
   if(!navigator.mediaDevices?.getUserMedia){status(`Camera API unavailable at ${location.origin}. Check Chrome camera permissions and whether this page is inside another app.`,true);return}
   $('startCamera').disabled=true;status('Requesting camera permission…');
-  try{const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}});
-    state.stream=stream;const video=$('video');video.srcObject=stream;await video.play();
-    stream.getVideoTracks()[0].onended=stopCombined;$('startCamera').disabled=true;$('stopCamera').disabled=false;
+  try{const stream=await navigator.mediaDevices.getUserMedia(cameraConstraints());
+    await attachCameraStream(stream);$('startCamera').disabled=true;$('stopCamera').disabled=false;
     status('Capturing every 4 seconds');showMedia();await capture('start');state.timer=setInterval(()=>void capture('timer'),4000)
   }catch(e){
     state.stream?.getTracks().forEach(track=>track.stop());state.stream=null;$('startCamera').disabled=false;
@@ -721,6 +760,9 @@ async function init(){const params=new URLSearchParams(location.search);state.se
     $('sessionStatus').textContent='Session ready'}
   catch(e){$('sessionStatus').textContent=e.message;return}
   $('startCamera').onclick=startCombined;$('stopCamera').onclick=stopCombined;
+  $('camera').onchange=switchCamera;
+  await refreshCameras();
+  navigator.mediaDevices?.addEventListener?.('devicechange',refreshCameras);
   $('connectPhone').onclick=openPhoneJoin;
   $('copyPhoneLink').onclick=async()=>{await navigator.clipboard.writeText($('phoneLink').href);$('copyPhoneLink').firstChild.textContent='Copied '};
   $('uploadSlides').onclick=()=>{$('uploadMenu').open=false;$('slideFiles').click()};
