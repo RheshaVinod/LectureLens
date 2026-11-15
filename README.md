@@ -9,6 +9,12 @@ LectureLens captures microphone audio and board images on one shared session clo
 3. Run `uvicorn app:app --host 0.0.0.0 --port 8000` and open the HTTPS Replit URL (or `http://localhost:8000`).
 4. Allow microphone and camera access, choose any detected built-in or external webcam from the **Camera** menu, and start the lecture. You can also upload slides or choose **Connect phone** and scan the QR code to take board photos with the phone's rear camera.
 
+## Deploy from GitHub
+
+The repository includes a `render.yaml` blueprint for deploying the FastAPI app from the `main` branch on Render. In Render, create a new Blueprint, connect this GitHub repository, and provide `OPENAI_API_KEY` when prompted. Every later commit to `main` deploys automatically.
+
+The prototype stores sessions, uploads, and snapshots on the web service's local filesystem. That data is ephemeral on Render unless the service is upgraded and configured with persistent storage. Do not share session URLs publicly because the prototype has no user authentication.
+
 To ask by voice in Chrome, tap the microphone in the question box, speak, then tap it again to finish. Review or edit the recognized text and press **Ask**. The current frame is pinned when dictation starts. If live captions are running, they pause during the question and resume afterward so the student's words are not stored as lecturer transcript. Voice dictation uses Chrome speech recognition and needs microphone permission on localhost or HTTPS.
 
 Each answer has a **Listen** button for optional natural read-aloud output. Tap **Cancel** while audio is being prepared or **Stop** during playback. The server sends the saved answer text (without citation labels or math markup) to OpenAI speech using the same server-side `OPENAI_API_KEY`, then returns WAV audio to the browser. Live captions pause during playback and resume afterward. The default voice model is `gpt-4o-mini-tts` with the `marin` voice; set `OPENAI_TTS_MODEL` or `OPENAI_TTS_VOICE` to override. The Speech API model is deprecated and scheduled to shut down in January 2027, so replace this integration for a longer-lived deployment. Playback audio is cached only in the current browser tab.

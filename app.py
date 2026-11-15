@@ -430,6 +430,11 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/phone")
 def phone():
     return FileResponse(ROOT / "static" / "phone.html")
